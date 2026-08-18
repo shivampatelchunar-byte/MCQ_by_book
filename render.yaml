@@ -29,9 +29,3 @@ services:
         sync: false
       - key: MISTRAL_API_KEY
         sync: false
-      - key: GITHUB_TOKEN
-        sync: false
-      - key: CEREBRAS_API_KEY
-        sync: false
-      - key: SAMBANOVA_API_KEY
-        sync: false
