@@ -4,7 +4,7 @@ pymupdf
 pymongo[srv]
 gspread
 google-auth
-python-telegram-bot==20.7
+python-telegram-bot
 uvicorn
 fastapi
 pydantic
