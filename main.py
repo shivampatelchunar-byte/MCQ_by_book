@@ -10,7 +10,7 @@ import gspread
 import requests
 import gdown
 import pymupdf as fitz
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from google.oauth2.service_account import Credentials
@@ -468,33 +468,53 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         traceback.print_exc()
         await update.message.reply_text(error_msg)
 
-# ✅ FIXED: Create event loop in thread
-def run_telegram_bot():
-    """Run Telegram bot with proper event loop setup"""
-    print("🤖 Starting Telegram Bot...")
-    
-    try:
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Build and run the bot
-        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
-        
-        # Run the bot with the event loop
-        # stop_signals=None is REQUIRED because this runs in a background
-        # thread — signal handlers can only be installed in the main thread.
-        app.run_polling(stop_signals=None)
-        
-    except Exception as e:
-        print(f"❌ Telegram Bot Error: {e}")
-        traceback.print_exc()
+# ==========================================
+# 9. TELEGRAM BOT — WEBHOOK MODE (no polling)
+# ==========================================
+# Built once at import time. Runs inside FastAPI's own event loop via
+# process_update(), so there's no separate thread/event loop and no
+# competing getUpdates() calls -> no more "Conflict" errors on redeploy.
+telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
+
+WEBHOOK_PATH = f"/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
+# Render auto-injects RENDER_EXTERNAL_URL for web services. WEBHOOK_URL can
+# be set manually as an override/fallback if that's ever missing.
+EXTERNAL_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
 # ==========================================
-# 9. FASTAPI KEEP-ALIVE
+# 10. FASTAPI APP
 # ==========================================
 app = FastAPI()
+
+@app.on_event("startup")
+async def on_startup():
+    await telegram_app.initialize()
+    await telegram_app.start()
+    if EXTERNAL_URL:
+        webhook_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
+        await telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        print(f"✅ Telegram webhook registered: {webhook_url}")
+    else:
+        print("⚠️ No RENDER_EXTERNAL_URL/WEBHOOK_URL found — webhook NOT set. "
+              "Set the WEBHOOK_URL env var manually to your public Render URL.")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await telegram_app.bot.delete_webhook()
+    except Exception:
+        pass
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Receives updates pushed by Telegram — replaces run_polling()."""
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
 
 @app.get("/")
 def keep_alive():
@@ -560,13 +580,8 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Worker thread error: {e}")
     
-    # 2. Start Telegram Bot in background thread
-    try:
-        bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-        bot_thread.start()
-        print("✅ Telegram Bot Thread Started")
-    except Exception as e:
-        print(f"❌ Telegram bot thread error: {e}")
+    # 2. Telegram Bot now runs in WEBHOOK mode (see startup event above) —
+    #    no separate thread/polling needed, so nothing to start here.
     
     # 3. Start FastAPI (Main Thread)
     try:
