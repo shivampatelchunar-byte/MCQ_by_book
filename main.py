@@ -9,7 +9,7 @@ import traceback
 import gspread
 import requests
 import gdown
-import fitz  # PyMuPDF
+import pymupdf as fitz  # Updated PyMuPDF import
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
