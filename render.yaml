@@ -4,28 +4,10 @@ services:
     runtime: python
     plan: starter
     autoDeploy: true
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir -r requirements.txt
     startCommand: python main.py
     envVars:
-      - key: MONGO_URI
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: GCP_SERVICE_ACCOUNT_JSON
-        sync: false
-      - key: GEMINI_API_KEY_1
-        sync: false
-      - key: GEMINI_API_KEY_2
-        sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false
-      - key: MISTRAL_API_KEY
-        sync: false
-      - key: GITHUB_TOKEN
-        sync: false
-      - key: CEREBRAS_API_KEY
-        sync: false
-      - key: SAMBANOVA_API_KEY
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.10
