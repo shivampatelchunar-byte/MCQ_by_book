@@ -73,6 +73,56 @@ def get_gspread_client():
         print(f"❌ Google Sheets auth error: {e}")
         raise
 
+def ocr_page_with_gemini_vision(doc, page_index: int) -> dict:
+    """
+    Renders a PDF page as an image and uses Gemini Vision to extract text.
+    Used as a fallback when a page has no extractable text layer
+    (i.e. the PDF is scanned/image-based).
+
+    IMPORTANT: This book is scanned as spreads (one PDF page = two printed
+    book pages side by side), and the PDF's own page index does NOT match
+    the book's printed page numbers (there's a cover/acknowledgement/contents
+    offset). So we ask Gemini to also read the actual printed page number(s)
+    from the header/footer of the image, and use THAT for topic mapping and
+    Sheet logging — never the raw PDF page count.
+
+    Returns: {"text": str, "page_numbers": list[int]}
+    """
+    try:
+        page = doc.load_page(page_index)
+        # Higher DPI = better OCR accuracy, at the cost of larger payload
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+
+        vision_model = genai.GenerativeModel('gemini-3.6-flash')
+        response = vision_model.generate_content([
+            "This is a scanned spread from an agriculture exam textbook. It may show "
+            "one or two printed book pages side by side. Respond in EXACTLY this format:\n"
+            "PAGE_NUMBERS: <comma-separated printed page number(s) found in the header/footer "
+            "of the image, left-to-right, digits only, e.g. '3,4'. If no printed page number "
+            "is visible, write NONE.>\n"
+            "---\n"
+            "<all readable body text from the page(s), exactly as written, preserving "
+            "paragraph structure. Ignore scanner watermarks like 'Scanned with...'. "
+            "If genuinely blank, leave this section empty.>",
+            {"mime_type": "image/png", "data": img_bytes}
+        ])
+        raw = (response.text or "").strip()
+
+        page_numbers = []
+        body_text = raw
+        if raw.upper().startswith("PAGE_NUMBERS:"):
+            header_line, _, rest = raw.partition("\n")
+            nums_part = header_line.split(":", 1)[1].strip()
+            if nums_part.upper() != "NONE":
+                page_numbers = [int(n) for n in re.findall(r"\d+", nums_part)]
+            body_text = rest.split("---", 1)[-1].strip() if "---" in rest else rest.strip()
+
+        return {"text": body_text, "page_numbers": page_numbers}
+    except Exception as e:
+        print(f"⚠️ Vision OCR failed for PDF page {page_index + 1}: {e}")
+        return {"text": "", "page_numbers": []}
+
 def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_book.pdf"):
     """Downloads PDF from Google Drive to Render's temporary storage."""
     try:
@@ -163,6 +213,22 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
 # ==========================================
 # 6. DYNAMIC TOPIC MAPPING LOGIC
 # ==========================================
+def resolve_book_page_label(detected_numbers: list, fallback_pdf_page: int):
+    """
+    Turns OCR-detected printed page number(s) into:
+      - a representative int for topic-range lookups (first detected number)
+      - a display label for the Sheet ('3-4' if a spread, '3' if single,
+        or 'PDF-p<N> (no printed number found)' as a last-resort fallback)
+    """
+    if detected_numbers:
+        numbers = sorted(set(detected_numbers))
+        representative = numbers[0]
+        label = f"{numbers[0]}-{numbers[-1]}" if len(numbers) > 1 else str(numbers[0])
+        return representative, label
+    # No printed number could be read — fall back to PDF index but flag it
+    # clearly so it's obvious in the Sheet that this wasn't a real book page number.
+    return fallback_pdf_page, f"PDF-p{fallback_pdf_page} (unread)"
+
 def get_topic_for_page(page_num: int) -> str:
     """Maps the page number to the exact syllabus topic."""
     if 1 <= page_num <= 27:
@@ -230,11 +296,20 @@ def background_worker_process():
                 continue
 
             # Process Page
+            pdf_page_num = current_page  # PDF sequential index — used ONLY for looping/resume
             page_text = doc.load_page(current_page - 1).get_text("text").strip()
-            
+            detected_page_numbers = []
+
+            if len(page_text) < 100:
+                print(f"🔍 PDF page {pdf_page_num} has no text layer, trying Gemini Vision OCR...")
+                ocr_result = ocr_page_with_gemini_vision(doc, current_page - 1)
+                page_text = ocr_result["text"]
+                detected_page_numbers = ocr_result["page_numbers"]
+
             if len(page_text) > 100:
-                topic = get_topic_for_page(current_page)
-                print(f"📚 Topic: {topic} | Text length: {len(page_text)} chars")
+                book_page_num, book_page_label = resolve_book_page_label(detected_page_numbers, pdf_page_num)
+                topic = get_topic_for_page(book_page_num)
+                print(f"📚 Book Page: {book_page_label} | Topic: {topic} | Text length: {len(page_text)} chars")
                 
                 mcq_data = generate_mcqs_with_fallback(page_text, config["system_prompt"])
                 print(f"✅ Generated {len(mcq_data.mcqs)} MCQs")
@@ -250,7 +325,7 @@ def background_worker_process():
                 for idx, item in enumerate(mcq_data.mcqs):
                     rows_to_append.append([
                         start_serial + idx,
-                        current_page,
+                        book_page_label,
                         topic,
                         item.question,
                         item.option_a,
@@ -271,7 +346,7 @@ def background_worker_process():
                     {"$inc": {"current_page": 1, "total_questions_generated": len(rows_to_append)}}
                 )
             else:
-                print(f"⏭️ Page {current_page} is empty, skipping... (extracted {len(page_text)} chars)")
+                print(f"⏭️ PDF page {pdf_page_num} empty even after OCR, skipping... (extracted {len(page_text)} chars)")
                 config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
 
             doc.close()
