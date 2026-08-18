@@ -9,7 +9,7 @@ import traceback
 import gspread
 import requests
 import gdown
-import pymupdf as fitz  # Updated PyMuPDF import
+import pymupdf as fitz
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
@@ -22,12 +22,10 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 # ==========================================
 # 1. ENVIRONMENT VARIABLES & SECRETS
 # ==========================================
-# Database & Control
 MONGO_URI = os.getenv("MONGO_URI")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
-# AI API Keys
 GEMINI_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 GEMINI_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
@@ -38,19 +36,19 @@ CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
 SAMBANOVA_KEY = os.getenv("SAMBANOVA_API_KEY")
 
 # ==========================================
-# 2. MONGODB DATABASE SETUP (The Brain)
+# 2. MONGODB DATABASE SETUP
 # ==========================================
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mcq_agent_db"]
 config_col = db["system_config"]
 
-# Initialize default configuration if it doesn't exist
+# Initialize default configuration
 if not config_col.find_one({"_id": "master_config"}):
     config_col.insert_one({
         "_id": "master_config",
         "sheet_url": "",
         "pdf_drive_link": "",
-        "worker_status": "paused",
+        "worker_status": "running",  # ✅ CHANGED: Start automatically
         "current_page": 1,
         "total_questions_generated": 0,
         "system_prompt": "Generate 5 to 10 exam-oriented MCQs from the given text. 60% direct, 40% tricky. Output strictly in English. Ensure no consecutive duplicate correct answers."
@@ -73,10 +71,17 @@ def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_bo
     
     download_url = f"https://drive.google.com/uc?id={file_id.group(1)}"
     gdown.download(download_url, output_path, quiet=False)
+    
+    # ✅ Added: Verify download
+    if os.path.exists(output_path):
+        print(f"✅ PDF downloaded successfully: {os.path.getsize(output_path)} bytes")
+    else:
+        print(f"❌ PDF download failed for {drive_link}")
+    
     return output_path
 
 # ==========================================
-# 4. PYDANTIC SCHEMAS (Strict Formatting)
+# 4. PYDANTIC SCHEMAS
 # ==========================================
 class SingleMCQ(BaseModel):
     question: str = Field(description="1-2 lines concise exam-oriented question")
@@ -94,7 +99,6 @@ class MCQList(BaseModel):
 # ==========================================
 # 5. MULTI-TIER AI FALLBACK ENGINE
 # ==========================================
-# Configured based on priority, reliability, and speed
 TIERS = [
     {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile", "key": GROQ_KEY},
     {"name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "model": "llama-3.3-70b", "key": CEREBRAS_KEY},
@@ -112,6 +116,7 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
             continue
             
         try:
+            print(f"🔄 Trying {tier['name']}...")
             client = OpenAI(api_key=tier["key"], base_url=tier["base_url"])
             response = client.chat.completions.create(
                 model=tier["model"],
@@ -129,11 +134,12 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
             if "mcqs" not in parsed_data and isinstance(parsed_data, list):
                 parsed_data = {"mcqs": parsed_data}
                 
+            print(f"✅ {tier['name']} succeeded!")
             return MCQList(**parsed_data)
             
         except Exception as e:
-            print(f"[{tier['name']} Failed]: {e}. Switching in 5 seconds...")
-            time.sleep(5)  # 5-second gap between fallback jumps to maintain hygiene
+            print(f"❌ [{tier['name']} Failed]: {e}. Switching in 5 seconds...")
+            time.sleep(5)
             continue
             
     raise RuntimeError("Critical Failure: All AI API tiers exhausted.")
@@ -142,7 +148,6 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
 # 6. DYNAMIC TOPIC MAPPING LOGIC
 # ==========================================
 def get_topic_for_page(page_num: int) -> str:
-    """Maps the page number to the exact syllabus topic."""
     if 1 <= page_num <= 27:
         return "General Agriculture"
     elif 28 <= page_num <= 214:
@@ -165,28 +170,43 @@ def get_topic_for_page(page_num: int) -> str:
         return "Preliminary / Index"
 
 # ==========================================
-# 7. BACKGROUND WORKER ENGINE
+# 7. BACKGROUND WORKER ENGINE (FIXED)
 # ==========================================
 def background_worker_process():
+    """Background worker with improved error handling and logging"""
+    print("🚀 Background Worker Started!")
+    
     while True:
         try:
             config = config_col.find_one({"_id": "master_config"})
             
             if config["worker_status"] != "running" or not config["sheet_url"] or not config["pdf_drive_link"]:
+                if config["worker_status"] != "running":
+                    print("⏸️ Worker paused")
+                elif not config["sheet_url"]:
+                    print("⚠️ No Google Sheet configured")
+                elif not config["pdf_drive_link"]:
+                    print("⚠️ No PDF Drive link configured")
                 time.sleep(10)
                 continue
 
             # Load PDF
             pdf_path = "/tmp/current_book.pdf"
             if not os.path.exists(pdf_path):
+                print("📥 Downloading PDF from Drive...")
                 download_pdf_from_drive(config["pdf_drive_link"], pdf_path)
             
             doc = fitz.open(pdf_path)
             current_page = config["current_page"]
             total_pages = len(doc)
             
+            print(f"📖 Processing Page {current_page}/{total_pages}")
+            
             if current_page > total_pages:
+                print("✅ All pages processed!")
                 config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "completed"}})
+                doc.close()
+                time.sleep(60)  # Check again in 1 minute
                 continue
 
             # Process Page
@@ -194,33 +214,36 @@ def background_worker_process():
             
             if len(page_text) > 100:  # Skip blank pages
                 topic = get_topic_for_page(current_page)
+                print(f"📚 Topic: {topic} | Text length: {len(page_text)} chars")
+                
                 mcq_data = generate_mcqs_with_fallback(page_text, config["system_prompt"])
+                print(f"✅ Generated {len(mcq_data.mcqs)} MCQs")
                 
                 # Append to Google Sheets
                 gc = get_gspread_client()
                 sheet = gc.open_by_url(config["sheet_url"]).sheet1
                 
-                # Fetch last serial number
                 existing_records = len(sheet.get_all_values())
                 start_serial = existing_records if existing_records > 0 else 1
                 
                 rows_to_append = []
                 for idx, item in enumerate(mcq_data.mcqs):
                     rows_to_append.append([
-                        start_serial + idx,           # Column 1: Serial Number
-                        current_page,                 # Column 2: Page Number
-                        topic,                        # Column 3: Content / Topic
-                        item.question,                # Column 4: Question
-                        item.option_a,                # Column 5: Option A
-                        item.option_b,                # Column 6: Option B
-                        item.option_c,                # Column 7: Option C
-                        item.option_d,                # Column 8: Option D
-                        item.option_e,                # Column 9: Option E
-                        item.correct_answer,          # Column 10: Answer
-                        item.explanation              # Column 11: Explanation
+                        start_serial + idx,
+                        current_page,
+                        topic,
+                        item.question,
+                        item.option_a,
+                        item.option_b,
+                        item.option_c,
+                        item.option_d,
+                        item.option_e,
+                        item.correct_answer,
+                        item.explanation
                     ])
                 
                 sheet.append_rows(rows_to_append)
+                print(f"📊 Added {len(rows_to_append)} rows to Google Sheet")
                 
                 # Update State
                 config_col.update_one(
@@ -228,21 +251,34 @@ def background_worker_process():
                     {"$inc": {"current_page": 1, "total_questions_generated": len(rows_to_append)}}
                 )
             else:
-                # If page is empty, just increment page number
+                print(f"⏭️ Page {current_page} is empty, skipping...")
                 config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
 
             doc.close()
             
-            # Ultra-Hygienic 5-Second Gap Between Pages
+            # ✅ Fixed: 5-second hygienic gap
             time.sleep(5)
 
         except Exception as e:
-            print(f"Worker Error: {e}")
-            traceback.print_exc()
+            error_msg = f"❌ Worker Error: {e}\n{traceback.format_exc()}"
+            print(error_msg)
+            
+            # ✅ Added: Log error to MongoDB for debugging
+            try:
+                error_log = db["error_logs"]
+                error_log.insert_one({
+                    "timestamp": time.time(),
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "config": config_col.find_one({"_id": "master_config"})
+                })
+            except:
+                pass
+            
             time.sleep(15)
 
 # ==========================================
-# 8. AGENTIC TELEGRAM BOT (LLM Powered)
+# 8. AGENTIC TELEGRAM BOT (FIXED)
 # ==========================================
 genai.configure(api_key=GEMINI_KEY_1)
 agent_model = genai.GenerativeModel('gemini-1.5-flash')
@@ -265,6 +301,9 @@ Return ONLY this JSON format:
 
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+    user_name = update.effective_user.first_name
+    
+    print(f"💬 Telegram from {user_name}: {user_text}")
     
     try:
         # LLM Intent Routing
@@ -278,41 +317,67 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         value = intent.get("extracted_value", "")
         reply = intent.get("reply_message", "Action acknowledged.")
         
+        print(f"🤖 Intent: {action} | Value: {value[:50] if value else 'None'}")
+        
         # Execute Database Updates Based on Intent
         if action == "update_sheet":
             config_col.update_one({"_id": "master_config"}, {"$set": {"sheet_url": value}})
+            reply = f"✅ Google Sheet updated!\n\n{reply}"
+            
         elif action == "update_pdf":
             config_col.update_one({"_id": "master_config"}, {"$set": {"pdf_drive_link": value, "current_page": 1}})
             # Delete old cached PDF
             if os.path.exists("/tmp/current_book.pdf"):
                 os.remove("/tmp/current_book.pdf")
+                reply = f"✅ PDF updated and cache cleared!\n\n{reply}"
+            else:
+                reply = f"✅ PDF configured!\n\n{reply}"
+                
         elif action == "update_prompt":
             config_col.update_one({"_id": "master_config"}, {"$set": {"system_prompt": value}})
+            reply = f"✅ System prompt updated!\n\n{reply}"
+            
         elif action == "start_worker":
             config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "running"}})
+            reply = f"🚀 Worker started!\n\n{reply}"
+            
         elif action == "pause_worker":
             config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "paused"}})
+            reply = f"⏸️ Worker paused.\n\n{reply}"
+            
         elif action == "status_report":
             config = config_col.find_one({"_id": "master_config"})
-            reply = (f"📊 **System Status:**\n"
-                     f"Status: {config['worker_status'].upper()}\n"
-                     f"Current Page: {config['current_page']}\n"
-                     f"Total MCQs Generated: {config['total_questions_generated']}\n"
-                     f"Active PDF: {'Configured' if config['pdf_drive_link'] else 'Missing'}\n"
-                     f"Active Sheet: {'Configured' if config['sheet_url'] else 'Missing'}")
-            
+            reply = (
+                f"📊 **System Status**\n\n"
+                f"┌─────────────────────────┐\n"
+                f"│ Status: {config['worker_status'].upper()}\n"
+                f"│ Page: {config['current_page']}\n"
+                f"│ MCQs Generated: {config['total_questions_generated']}\n"
+                f"│ PDF: {'✅' if config['pdf_drive_link'] else '❌'}\n"
+                f"│ Sheet: {'✅' if config['sheet_url'] else '❌'}\n"
+                f"└─────────────────────────┘"
+            )
+        
         await update.message.reply_text(reply)
         
     except Exception as e:
-        await update.message.reply_text(f"Agent Processing Error: {str(e)}. Please try rephrasing your request.")
+        error_msg = f"❌ Agent Error: {str(e)}\nPlease try rephrasing your request."
+        print(f"❌ Telegram Error: {e}")
+        await update.message.reply_text(error_msg)
 
+# ✅ FIXED: Telegram Bot with signal_handlers=False for Python 3.14
 def run_telegram_bot():
+    """Run Telegram bot with signal handlers disabled (Python 3.14 compatibility)"""
+    print("🤖 Starting Telegram Bot...")
+    
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
-    app.run_polling()
+    
+    # ✅ CRITICAL FIX: Disable signal handlers for Python 3.14 threading compatibility
+    app.run_polling(signal_handlers=False)
 
 # ==========================================
-# 9. FASTAPI KEEP-ALIVE (For Render)
+# 9. FASTAPI KEEP-ALIVE
 # ==========================================
 app = FastAPI()
 
@@ -322,21 +387,50 @@ def keep_alive():
     return {
         "service": "AI_MCQ_Agent_Active",
         "status": config["worker_status"],
-        "current_page": config["current_page"]
+        "current_page": config["current_page"],
+        "total_questions_generated": config["total_questions_generated"],
+        "timestamp": time.time()
     }
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "uptime": time.time() - start_time}
+
 # ==========================================
-# 10. SYSTEM ENTRY POINT
+# 10. SYSTEM ENTRY POINT (FIXED)
 # ==========================================
+start_time = time.time()
+
 if __name__ == "__main__":
-    # 1. Start the Background PDF Worker
+    import uvicorn
+    
+    print("=" * 60)
+    print("🚀 AI MCQ Generator System Starting...")
+    print("=" * 60)
+    
+    # 1. Start the Background PDF Worker (in daemon thread - safe)
     worker_thread = threading.Thread(target=background_worker_process, daemon=True)
     worker_thread.start()
+    print("✅ Background Worker Thread Started")
     
-    # 2. Start the Autonomous Telegram Agent
-    tg_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    tg_thread.start()
+    # 2. Wait for worker to initialize
+    time.sleep(2)
     
-    # 3. Uvicorn handles the main thread for FastAPI
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # 3. Start FastAPI in a separate thread
+    def run_api():
+        port = int(os.environ.get("PORT", 8080))
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+    print(f"✅ FastAPI Server Started on port {os.environ.get('PORT', 8080)}")
+    
+    # 4. Run Telegram Bot in MAIN THREAD (with signal_handlers=False)
+    print("✅ Telegram Bot Initializing...")
+    try:
+        run_telegram_bot()
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down gracefully...")
+    except Exception as e:
+        print(f"❌ Telegram Bot Error: {e}")
+        traceback.print_exc()
