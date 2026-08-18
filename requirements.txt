@@ -1,0 +1,12 @@
+google-generativeai
+openai
+pymupdf
+pymongo[srv]
+gspread
+google-auth
+python-telegram-bot==20.7
+uvicorn
+fastapi
+pydantic
+requests
+gdown
