@@ -96,7 +96,7 @@ def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_bo
         raise
 
 # ==========================================
-# 4. PYDANTIC SCHEMAS (pydantic v1 compatible)
+# 4. PYDANTIC SCHEMAS
 # ==========================================
 class SingleMCQ(BaseModel):
     question: str = Field(description="1-2 lines concise exam-oriented question")
@@ -296,7 +296,7 @@ def background_worker_process():
             time.sleep(15)
 
 # ==========================================
-# 8. AGENTIC TELEGRAM BOT
+# 8. AGENTIC TELEGRAM BOT (FIXED FOR EVENT LOOP)
 # ==========================================
 try:
     genai.configure(api_key=GEMINI_KEY_1)
@@ -304,6 +304,7 @@ try:
     print("✅ Gemini configured successfully!")
 except Exception as e:
     print(f"⚠️ Gemini config warning: {e}")
+    agent_model = None
 
 AGENT_PROMPT = """
 You are the Autonomous AI Manager for an MCQ Generation System. 
@@ -329,6 +330,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     print(f"💬 Telegram from {user_name}: {user_text}")
     
     try:
+        if agent_model is None:
+            await update.message.reply_text("❌ AI Agent not configured. Please check Gemini API key.")
+            return
+            
         # LLM Intent Routing
         response = agent_model.generate_content(
             f"{AGENT_PROMPT}\n\nUser Input: {user_text}",
@@ -385,16 +390,26 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         error_msg = f"❌ Agent Error: {str(e)}\nPlease try rephrasing your request."
         print(f"❌ Telegram Error: {e}")
+        traceback.print_exc()
         await update.message.reply_text(error_msg)
 
+# ✅ FIXED: Create event loop in thread
 def run_telegram_bot():
-    """Run Telegram bot with signal handlers disabled for Python 3.11 compatibility"""
+    """Run Telegram bot with proper event loop setup"""
     print("🤖 Starting Telegram Bot...")
     
     try:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Build and run the bot
         app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
+        
+        # Run the bot with the event loop
         app.run_polling()
+        
     except Exception as e:
         print(f"❌ Telegram Bot Error: {e}")
         traceback.print_exc()
@@ -407,29 +422,42 @@ app = FastAPI()
 @app.get("/")
 def keep_alive():
     """Health check endpoint"""
-    config = config_col.find_one({"_id": "master_config"})
-    return {
-        "service": "AI_MCQ_Agent_Active",
-        "status": config["worker_status"],
-        "current_page": config["current_page"],
-        "total_questions_generated": config["total_questions_generated"],
-        "timestamp": time.time()
-    }
+    try:
+        config = config_col.find_one({"_id": "master_config"})
+        return {
+            "service": "AI_MCQ_Agent_Active",
+            "status": config["worker_status"],
+            "current_page": config["current_page"],
+            "total_questions_generated": config["total_questions_generated"],
+            "timestamp": time.time()
+        }
+    except:
+        return {
+            "service": "AI_MCQ_Agent_Active",
+            "status": "starting",
+            "timestamp": time.time()
+        }
 
 @app.get("/health")
 def health_check():
     """Detailed health check"""
-    return {
-        "status": "healthy", 
-        "uptime": time.time() - start_time,
-        "mongo": "connected",
-        "api_keys": {
-            "gemini": bool(GEMINI_KEY_1),
-            "groq": bool(GROQ_KEY),
-            "mistral": bool(MISTRAL_KEY),
-            "openrouter": bool(OPENROUTER_KEY)
+    try:
+        config = config_col.find_one({"_id": "master_config"})
+        return {
+            "status": "healthy",
+            "uptime": time.time() - start_time,
+            "mongo": "connected",
+            "worker_status": config["worker_status"],
+            "current_page": config["current_page"],
+            "api_keys": {
+                "gemini": bool(GEMINI_KEY_1),
+                "groq": bool(GROQ_KEY),
+                "mistral": bool(MISTRAL_KEY),
+                "openrouter": bool(OPENROUTER_KEY)
+            }
         }
-    }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
 
 # ==========================================
 # 10. SYSTEM ENTRY POINT
