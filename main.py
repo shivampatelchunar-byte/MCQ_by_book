@@ -271,7 +271,7 @@ def background_worker_process():
                     {"$inc": {"current_page": 1, "total_questions_generated": len(rows_to_append)}}
                 )
             else:
-                print(f"⏭️ Page {current_page} is empty, skipping...")
+                print(f"⏭️ Page {current_page} is empty, skipping... (extracted {len(page_text)} chars)")
                 config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
 
             doc.close()
