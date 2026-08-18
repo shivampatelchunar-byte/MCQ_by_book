@@ -11,6 +11,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.10
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: MONGO_URI
         sync: false
       - key: TELEGRAM_BOT_TOKEN
