@@ -300,7 +300,7 @@ def background_worker_process():
 # ==========================================
 try:
     genai.configure(api_key=GEMINI_KEY_1)
-    agent_model = genai.GenerativeModel('gemini-2.5-flash')
+    agent_model = genai.GenerativeModel('gemini-3.6-flash')
     print("✅ Gemini configured successfully!")
 except Exception as e:
     print(f"⚠️ Gemini config warning: {e}")
