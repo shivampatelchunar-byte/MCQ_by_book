@@ -408,7 +408,9 @@ def run_telegram_bot():
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
         
         # Run the bot with the event loop
-        app.run_polling()
+        # stop_signals=None is REQUIRED because this runs in a background
+        # thread — signal handlers can only be installed in the main thread.
+        app.run_polling(stop_signals=None)
         
     except Exception as e:
         print(f"❌ Telegram Bot Error: {e}")
