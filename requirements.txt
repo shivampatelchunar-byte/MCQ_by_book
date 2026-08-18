@@ -1,12 +1,12 @@
 google-generativeai==0.8.3
-openai==1.35.13
+openai==1.30.0
 pymupdf==1.24.10
 pymongo[srv]==4.8.0
 gspread==6.1.2
 google-auth==2.33.0
-python-telegram-bot==20.8
-uvicorn==0.30.6
-fastapi==0.115.0
+python-telegram-bot==20.7
+uvicorn==0.27.0
+fastapi==0.104.1
 pydantic==1.10.13
 requests==2.32.3
 gdown==5.2.0
