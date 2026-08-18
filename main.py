@@ -53,11 +53,11 @@ if not config_col.find_one({"_id": "master_config"}):
         "worker_status": "paused",
         "current_page": 1,
         "total_questions_generated": 0,
-        "system_prompt": "Generate 5 to 10 exam-oriented MCQs from the given text. 60% direct questions, 40% tricky. Output strictly in English.",
+        "system_prompt": "Generate 5 to 10 exam-oriented MCQs from the given text. 60% direct questions, 40% tricky/application-based. OUTPUT MUST BE IN PURE ENGLISH ONLY. Do not use a single word of Hindi. Correct answer must not be consecutive same letters.",
     })
 
 # ============================================================
-# 3. GEMINI MODELS CONFIGURATION (Updated as Requested)
+# 3. GEMINI MODELS CONFIGURATION
 # ============================================================
 if GEMINI_KEYS:
     genai.configure(api_key=GEMINI_KEYS[0])
@@ -70,13 +70,13 @@ GEMINI_MODELS = [
     },
     {
         "name": "Gemini 3.1 Flash-Lite",
-        "model": "gemini-2.5-flash-lite", # Native ID for the 3.1/2.5 Lite architecture
+        "model": "gemini-2.5-flash-lite", 
         "description": "Cost-efficient, high-volume workloads"
     }
 ]
 
 # ============================================================
-# 4. MULTI-TIER LLM NETWORK (For Worker & Telegram Bot)
+# 4. MULTI-TIER LLM NETWORK
 # ============================================================
 TIERS = [
     {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile", "key": GROQ_KEY},
@@ -105,7 +105,7 @@ def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_bo
     return output_path
 
 # ============================================================
-# 6. PYDANTIC SCHEMAS
+# 6. PYDANTIC SCHEMAS (PURE ENGLISH ENFORCED)
 # ============================================================
 class SingleMCQ(BaseModel):
     question: str
@@ -124,9 +124,9 @@ class MCQList(BaseModel):
 # 7. MCQ WORKER FALLBACK ENGINE
 # ============================================================
 def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
-    full_prompt = f"{custom_prompt}\n\nPAGE TEXT:\n{page_text[:10000]}\n\nReturn ONLY valid JSON with 'mcqs' array."
+    full_prompt = f"{custom_prompt}\n\nPAGE TEXT:\n{page_text[:10000]}\n\nReturn ONLY valid JSON with 'mcqs' array. Every single word MUST be in PURE ENGLISH."
     
-    # 1. Try Gemini
+    # Try Gemini First
     for gem_model in GEMINI_MODELS:
         for key in GEMINI_KEYS:
             try:
@@ -137,7 +137,7 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
             except Exception:
                 continue
 
-    # 2. Try Open-Source Tiers
+    # Try Open-Source Tiers
     for tier in TIERS:
         if not tier["key"]: continue
         try:
@@ -155,12 +155,10 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
     raise RuntimeError("All AI providers failed to generate MCQs.")
 
 # ============================================================
-# 8. AGENTIC TELEGRAM BOT (LLM POWERED)
+# 8. AGENTIC TELEGRAM BOT
 # ============================================================
 def ask_universal_llm(prompt_text: str) -> str:
-    """The brain of the Telegram bot. Uses ALL keys to guarantee a smart response."""
-    
-    # 1. Try Gemini First (Best for chat)
+    # Try Gemini First
     for key in GEMINI_KEYS:
         try:
             genai.configure(api_key=key)
@@ -169,7 +167,7 @@ def ask_universal_llm(prompt_text: str) -> str:
         except Exception:
             continue
             
-    # 2. Fallback to OpenRouter / Groq / Mistral for chat
+    # Fallback to OpenRouter / Groq / Mistral
     for tier in TIERS:
         if not tier["key"]: continue
         try:
@@ -190,7 +188,6 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     user_text = update.message.text
     config = config_col.find_one({"_id": "master_config"})
     
-    # SYSTEM PROMPT FOR THE AGENT
     agent_prompt = f"""
     You are an autonomous AI Manager. The user is talking to you via Telegram.
     Analyze the user's message: "{user_text}"
@@ -208,12 +205,9 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     - Total MCQs: {config['total_questions_generated']}
     """
     
-    # Get response from our multi-key LLM Engine
     ai_response = ask_universal_llm(agent_prompt)
-    
     reply_text = ai_response
     
-    # Action Parsing Logic
     if "[ACTION: UPDATE_SHEET:" in ai_response:
         link = re.search(r'\[ACTION: UPDATE_SHEET: (.*?)\]', ai_response).group(1)
         config_col.update_one({"_id": "master_config"}, {"$set": {"sheet_url": link.strip()}})
@@ -239,12 +233,23 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(reply_text.strip())
 
 def run_telegram_bot_thread():
-    """Runs the Telegram bot in a dedicated asyncio loop to prevent crash"""
+    """CRASH-PROOF TELEGRAM BOT THREAD"""
+    # 1. Clear Old Webhooks (Fixes 404 Error)
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
+        print("🧹 Cleared old Telegram Webhooks")
+    except Exception as e:
+        print(f"Webhook Clear Error: {e}")
+
+    # 2. Setup Asyncio Loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
-    app.run_polling()
+    
+    # 3. Start Polling with stop_signals=() (Fixes 'set_wakeup_fd' Error)
+    print("🤖 Telegram Agent Polling Started...")
+    app.run_polling(stop_signals=())
 
 # ============================================================
 # 9. BACKGROUND PDF WORKER
@@ -254,7 +259,7 @@ def get_topic_for_page(page_num: int) -> str:
     elif page_num <= 214: return "Agronomy"
     elif page_num <= 318: return "Soil Science"
     elif page_num <= 338: return "Agrometeorology"
-    elif page_num <= 407: return "Animal Husbandry"
+    elif page_num <= 407: return "Animal Husbandry and Dairy Science"
     elif page_num <= 466: return "Agricultural Extension"
     elif page_num <= 540: return "Agricultural Economics"
     elif page_num <= 571: return "Agricultural Statistics"
@@ -307,7 +312,7 @@ def background_worker_process():
                 config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
 
             doc.close()
-            time.sleep(5)  # Hygienic 5-second gap
+            time.sleep(5)  # 5-second gap for hygiene
 
         except Exception as e:
             print(f"Worker Error: {e}")
@@ -325,10 +330,10 @@ def home():
 if __name__ == "__main__":
     import uvicorn
     
-    # 1. Start PDF Worker
+    # 1. Start PDF Worker Thread
     threading.Thread(target=background_worker_process, daemon=True).start()
     
-    # 2. Start Smart Telegram Agent (Crash-Proof Loop)
+    # 2. Start Smart Telegram Agent Thread
     threading.Thread(target=run_telegram_bot_thread, daemon=True).start()
     
     # 3. Start FastAPI Web Server
