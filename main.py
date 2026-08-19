@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 import gdown
 import gspread
 import pymupdf as fitz
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from pymongo import ASCENDING, MongoClient, ReturnDocument
@@ -70,7 +70,8 @@ _requested_gemini_model = env("GEMINI_MODEL", default="gemini-3.6-flash")
 # Gemini retired this model; tolerate an old Render setting during migration.
 GEMINI_MODEL = "gemini-3.6-flash" if _requested_gemini_model in {"gemini-2.0-flash", "gemini-2.0-flash-001"} else _requested_gemini_model
 MAX_PDF_MB = int(env("MAX_PDF_MB", default="80"))
-OCR_DPI = int(env("OCR_DPI", default="160"))
+OCR_DPI = int(env("OCR_DPI", default="120"))
+OCR_TIMEOUT_SECONDS = int(env("OCR_TIMEOUT_SECONDS", default="180"))
 LEASE_SECONDS = int(env("WORKER_LEASE_SECONDS", default="120"))
 WEBHOOK_PATH = "/telegram-webhook"  # Never put BOT_TOKEN in a URL.
 
@@ -168,9 +169,14 @@ def configured_providers() -> list[dict[str, str]]:
 def ocr_page(document: fitz.Document, page_index: int) -> tuple[str, list[int]]:
     if not GEMINI_KEYS or genai is None:
         raise RuntimeError("At least one Gemini key and google-generativeai are required for OCR")
-    image = document.load_page(page_index).get_pixmap(dpi=OCR_DPI, alpha=False).tobytes("png")
-    if len(image) > 16 * 1024 * 1024:
-        raise RuntimeError("Rendered page is too large; lower OCR_DPI")
+    page = document.load_page(page_index)
+    image = page.get_pixmap(dpi=OCR_DPI, alpha=False).tobytes("png")
+    # Vision requests are more reliable with modest image payloads.  Retry at
+    # 96 DPI before failing; text is still readable for textbook pages.
+    if len(image) > 8 * 1024 * 1024:
+        image = page.get_pixmap(dpi=96, alpha=False).tobytes("png")
+    if len(image) > 12 * 1024 * 1024:
+        raise RuntimeError("Rendered page is too large even at reduced OCR DPI")
     prompt = (
         "Analyze this textbook page completely, including text, tables, charts, labels, captions, diagrams, photographs and other useful visual details. Return exactly two sections:\n"
         "PAGE_NUMBERS: comma-separated printed page numbers found only in header/footer, or NONE\n"
@@ -178,17 +184,21 @@ def ocr_page(document: fitz.Document, page_index: int) -> tuple[str, list[int]]:
     )
     last_error: Exception | None = None
     for key in GEMINI_KEYS:
-        try:
-            genai.configure(api_key=key)
-            response = genai.GenerativeModel(GEMINI_MODEL).generate_content(
-                [prompt, {"mime_type": "image/png", "data": image}], request_options={"timeout": 90}
-            )
-            text = (response.text or "").strip()
-            header, _, body = text.partition("\n")
-            numbers = [] if "NONE" in header.upper() else [int(n) for n in re.findall(r"\d+", header)]
-            return body.replace("BODY:", "", 1).strip(), sorted(set(numbers))
-        except Exception as exc:
-            last_error = exc
+        for attempt in range(1, 4):
+            try:
+                genai.configure(api_key=key)
+                response = genai.GenerativeModel(GEMINI_MODEL).generate_content(
+                    [prompt, {"mime_type": "image/png", "data": image}],
+                    request_options={"timeout": OCR_TIMEOUT_SECONDS},
+                )
+                text = (response.text or "").strip()
+                header, _, body = text.partition("\n")
+                numbers = [] if "NONE" in header.upper() else [int(n) for n in re.findall(r"\d+", header)]
+                return body.replace("BODY:", "", 1).strip(), sorted(set(numbers))
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(attempt * 3)
     raise RuntimeError("Gemini OCR failed with every configured key") from last_error
 
 
@@ -468,6 +478,12 @@ def health():
 @app.get("/")
 def root():
     return {"status": "ok", "health": "/health"}
+
+
+@app.head("/")
+def root_head():
+    # Render may use HEAD / as its initial health probe.
+    return Response(status_code=200)
 
 
 if __name__ == "__main__":
