@@ -716,10 +716,13 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    try:
-        await telegram_app.bot.delete_webhook()
-    except Exception:
-        pass
+    # NOTE: We deliberately do NOT call bot.delete_webhook() here.
+    # During a redeploy, the OLD instance's shutdown can briefly overlap
+    # with the NEW instance's startup — if the old instance deletes the
+    # webhook after the new one just registered it, the webhook ends up
+    # empty even though startup logged success. Since set_webhook() is
+    # idempotent and always re-runs on the next startup, there's no need
+    # to delete it on shutdown at all.
     await telegram_app.stop()
     await telegram_app.shutdown()
 
