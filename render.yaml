@@ -27,7 +27,7 @@ services:
       - key: GEMINI_API_KEY_2
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.0-flash
+        value: gemini-3.6-flash
       - key: CEREBRAS_API_KEY
         sync: false
       - key: GROQ_API_KEY
