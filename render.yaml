@@ -4,18 +4,21 @@ services:
     runtime: python
     plan: starter
     autoDeploy: true
-    buildCommand: |
-      pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-    startCommand: python main.py
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.10
-      - key: PYTHONUNBUFFERED
-        value: "1"
       - key: MONGO_URI
         sync: false
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
+      - key: WEBHOOK_URL
         sync: false
       - key: GCP_SERVICE_ACCOUNT_JSON
         sync: false
@@ -23,13 +26,17 @@ services:
         sync: false
       - key: GEMINI_API_KEY_2
         sync: false
-      - key: GROQ_API_KEY
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: CEREBRAS_API_KEY
         sync: false
-      - key: OPENROUTER_API_KEY
+      - key: GROQ_API_KEY
         sync: false
       - key: MISTRAL_API_KEY
         sync: false
-      - key: CEREBRAS_API_KEY
-        sync: false
       - key: SAMBANOVA_API_KEY
         sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: MAX_PDF_MB
+        value: "80"

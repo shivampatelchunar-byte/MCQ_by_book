@@ -1,48 +1,11 @@
-# 📚 AI MCQ Generator System v2.0
+# Secure MCQ Generator
 
-## 🎯 **What This System Does**
+Deploy this directory as the Render repository root. Add every secret in the Render dashboard, never in Git.
 
-1. **Reads your SCANNED PDF** from Google Drive using Gemini Vision OCR
-2. **Extracts text** from each page (even if it's an image-based scan)
-3. **Generates MCQs** using multiple AI providers with fallback
-4. **Saves to Google Sheets** with proper tracking
-5. **Resume capability** - if you stop at page 50, it starts from page 51
+Required configuration: `MONGO_URI`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_IDS`, `WEBHOOK_URL`, `GCP_SERVICE_ACCOUNT_JSON`, one Gemini key, and at least one MCQ-provider key. Render generates `TELEGRAM_WEBHOOK_SECRET` from `render.yaml`.
 
-## 🚀 **Key Features**
+`TELEGRAM_ALLOWED_USER_IDS` contains numeric Telegram user IDs separated by commas. The Google Sheet must be shared with the `client_email` inside the service-account JSON as **Editor**.
 
-- ✅ **Scanned PDF Support** - Uses Gemini Vision for OCR
-- ✅ **Multi-Provider AI** - 6 different providers with fallback
-- ✅ **Resume Processing** - MongoDB tracks progress
-- ✅ **Telegram Control** - Natural language commands
-- ✅ **Error Recovery** - Auto-retry and logging
+Provider selection is automatic: only keys present in Render are enabled. Defaults can be overridden with `CEREBRAS_MODEL`, `GROQ_MODEL`, `MISTRAL_MODEL`, `SAMBANOVA_MODEL`, or `OPENROUTER_MODEL`.
 
-## 📱 **Telegram Commands**
-
-| Command | What It Does |
-|---------|--------------|
-| `Status?` | Shows current progress |
-| `Start generating` | Starts the worker |
-| `Pause system` | Pauses the worker |
-| `Set PDF to [link]` | Updates PDF source |
-| `Set sheet to [link]` | Updates output sheet |
-| `Reset to page [number]` | Resets processing to specific page |
-
-## 🔧 **How Resume Works**
-
-1. MongoDB stores `current_page`, `pages_completed`
-2. If system restarts, it continues from last saved page
-3. You can manually reset to any page via Telegram
-4. No duplicate MCQs - tracking prevents re-processing
-
-## 📊 **Google Sheet Format**
-
-| Column | Content |
-|--------|---------|
-| 1 | Serial Number |
-| 2 | Page Number |
-| 3 | Topic |
-| 4 | Question |
-| 5-9 | Options A-E |
-| 10 | Correct Answer |
-| 11 | Explanation |
-| 12 | Timestamp |
+Telegram commands: `/set_pdf <Google Drive URL>`, `/set_sheet <Google Sheets URL>`, `/start`, `/pause`, `/reset <PDF page>`, and `/status`.
