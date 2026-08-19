@@ -42,7 +42,7 @@ from google.oauth2.service_account import Credentials
 import google.generativeai as genai
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 
 # =====================================================================
@@ -677,7 +677,17 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 # Built once at import time. Runs inside FastAPI's own event loop via
 # process_update() — no separate thread/event loop, no competing
 # getUpdates() calls, so there's no "Conflict" error on redeploy.
+async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /start and /help — Telegram commands are excluded by the
+    plain-text MessageHandler below, so they need their own handler."""
+    print(f"💬 Telegram /start-or-help from {update.effective_user.first_name}")
+    await update.message.reply_text(
+        f"👋 Namaste! AI MCQ Generator bot chalu hai.\n\n{HELP_TEXT}"
+    )
+
+
 telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+telegram_app.add_handler(CommandHandler(["start", "help"], handle_start_command))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
 
 WEBHOOK_PATH = f"/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
