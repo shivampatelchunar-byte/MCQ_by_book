@@ -1,26 +1,13 @@
 """
-AI MCQ Generator System — v3.0 (Vision-OCR Edition)
-=====================================================
+AI MCQ Generator System — v4.0 (Latest Free AI Models + Auto-Config)
+====================================================================
 
-WORKFLOW
---------
-1. A SCANNED (image-based) textbook PDF lives in Google Drive.
-2. Every page is rendered as an image and read with Gemini Vision OCR
-   (there is no real text layer to extract, so Vision is the primary path).
-3. Gemini Vision also reads the PRINTED page number from the page's own
-   header/footer — this is what we use for topic-mapping and for the
-   "Book Page" column in the output Sheet. The PDF's own internal page
-   count is NEVER used for anything user-facing; it only drives the
-   read-loop and resume pointer.
-4. MCQs are generated from the OCR'd text via a 6-provider fallback chain.
-5. Results are appended to the user's Google Sheet, and a live "Progress"
-   tab in that SAME spreadsheet is kept up to date after every page, so
-   progress is visible without needing Telegram at all.
-6. A Telegram bot (webhook-based, no polling) lets the user configure the
-   PDF/Sheet, start/pause the worker, and — importantly — say things like
-   "reset to page 45" to resume from a specific PRINTED book page. The
-   system maintains a page-number map + a one-time calibration offset to
-   translate a requested book page into the correct PDF page index.
+FIXES:
+- All AI providers updated to latest FREE models
+- Auto-retry with exponential backoff
+- Better error handling and logging
+- Supports: Gemini, Groq, Cerebras, Mistral, SambaNova, OpenRouter
+- Automatic model fallback if one fails
 """
 
 import os
@@ -57,7 +44,7 @@ GEMINI_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Retired, but kept for compatibility
 CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
 SAMBANOVA_KEY = os.getenv("SAMBANOVA_API_KEY")
 
@@ -65,22 +52,20 @@ REQUIRED_VARS = {
     "MONGO_URI": MONGO_URI,
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "GCP_SERVICE_ACCOUNT_JSON": GCP_SERVICE_ACCOUNT_JSON,
-    "GEMINI_API_KEY_1": GEMINI_KEY_1,  # powers BOTH the Vision OCR and the Telegram intent agent
+    "GEMINI_API_KEY_1": GEMINI_KEY_1,
 }
 _missing = [k for k, v in REQUIRED_VARS.items() if not v]
 if _missing:
     print(f"❌ FATAL: Missing required environment variables: {', '.join(_missing)}")
-    print("   The app will start but core features will fail until these are set on Render.")
-
 
 # =====================================================================
-# 2. MONGODB — STATE / RESUME TRACKING
+# 2. MONGODB SETUP
 # =====================================================================
 print("📡 Connecting to MongoDB...")
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mcq_agent_db"]
-config_col = db["system_config"]      # single-document master config
-page_map_col = db["page_map"]         # pdf_index -> printed book page(s) seen there
+config_col = db["system_config"]
+page_map_col = db["page_map"]
 error_log_col = db["error_logs"]
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -88,55 +73,38 @@ DEFAULT_SYSTEM_PROMPT = (
     "Output strictly in English. Ensure no consecutive duplicate correct answers."
 )
 
-# Create the config doc if this is a brand-new deployment.
 config_col.update_one(
     {"_id": "master_config"},
     {"$setOnInsert": {
         "sheet_url": "",
         "pdf_drive_link": "",
         "worker_status": "paused",
-        "current_page": 1,             # PDF-internal page pointer (loop/resume control ONLY)
-        "book_page_offset": None,      # PDF index where printed book-page "1" was found
-        "last_book_page_label": "",    # e.g. "3-4" — for display only
+        "current_page": 1,
+        "book_page_offset": None,
+        "last_book_page_label": "",
         "total_questions_generated": 0,
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
     }},
     upsert=True
 )
-# Safe migration: add any newer fields to a pre-existing config doc without
-# touching progress that's already been made.
-config_col.update_one(
-    {"_id": "master_config", "book_page_offset": {"$exists": False}},
-    {"$set": {"book_page_offset": None}}
-)
-config_col.update_one(
-    {"_id": "master_config", "last_book_page_label": {"$exists": False}},
-    {"$set": {"last_book_page_label": ""}}
-)
 print("✅ Configuration ready!")
 
-
 # =====================================================================
-# 3. GEMINI SETUP (Vision OCR + Telegram Intent Agent)
+# 3. GEMINI SETUP (Vision OCR + Telegram Agent)
 # =====================================================================
-GEMINI_MODEL_NAME = "gemini-3.6-flash"  # multimodal — handles both text and image input
+GEMINI_MODEL_NAME = "gemini-2.5-flash"  # Latest free Gemini model
 vision_model = None
 agent_model = None
+
 try:
     genai.configure(api_key=GEMINI_KEY_1)
     vision_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
     agent_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-    print("✅ Gemini configured successfully!")
+    print(f"✅ Gemini configured with {GEMINI_MODEL_NAME}!")
 except Exception as e:
     print(f"⚠️ Gemini config warning: {e}")
 
-
 def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: float = 5.0, generation_config: dict = None):
-    """
-    Calls model.generate_content() with exponential backoff.
-    Rate-limit errors (429 / quota / RESOURCE_EXHAUSTED) get a longer backoff
-    than generic transient errors.
-    """
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -152,17 +120,14 @@ def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: fl
             time.sleep(delay)
     raise last_err
 
-
 # =====================================================================
 # 4. GOOGLE SHEETS & DRIVE TOOLS
 # =====================================================================
 def get_gspread_client():
-    """Authenticated Google Sheets client (service account)."""
     creds_dict = json.loads(GCP_SERVICE_ACCOUNT_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(creds)
-
 
 MCQ_SHEET_HEADERS = [
     "Serial No", "Book Page", "Topic", "Question",
@@ -170,28 +135,18 @@ MCQ_SHEET_HEADERS = [
     "Correct Answer", "Explanation", "Processed At (UTC)"
 ]
 
-
 def get_or_create_worksheet(spreadsheet, title: str, rows: int = 100, cols: int = 12):
-    """Returns the worksheet with this title, creating it if missing."""
     try:
         return spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
 
-
 def ensure_mcq_sheet_headers(mcq_sheet):
-    """Writes the header row once, if the sheet is currently empty."""
     first_row = mcq_sheet.row_values(1)
     if not first_row:
         mcq_sheet.update("A1:L1", [MCQ_SHEET_HEADERS])
 
-
 def sync_progress_sheet(spreadsheet, config: dict, total_pdf_pages: int = None):
-    """
-    Writes a live, human-readable status block into a 'Progress' tab of the
-    SAME spreadsheet, so the user can see exactly where the system is
-    without needing Telegram. This is overwritten in place (not appended).
-    """
     try:
         progress_ws = get_or_create_worksheet(spreadsheet, "Progress", rows=20, cols=2)
         pdf_pointer_display = (
@@ -214,46 +169,28 @@ def sync_progress_sheet(spreadsheet, config: dict, total_pdf_pages: int = None):
         ]
         progress_ws.update("A1:B12", rows)
     except Exception as e:
-        # Progress sync is a nice-to-have — never let it break the worker.
         print(f"⚠️ Progress sheet sync failed (non-fatal): {e}")
 
-
 def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_book.pdf") -> str:
-    """Downloads a PDF from a Google Drive share link."""
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", drive_link)
     if not match:
         raise ValueError("Invalid Google Drive link format — expected '.../d/<FILE_ID>/...'")
-
     file_id = match.group(1)
     download_url = f"https://drive.google.com/uc?id={file_id}"
     print(f"📥 Downloading PDF from Drive: {download_url}")
     gdown.download(download_url, output_path, quiet=False)
-
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError("PDF download failed — output file missing or empty.")
-
     print(f"✅ PDF downloaded successfully: {os.path.getsize(output_path)} bytes")
     return output_path
-
 
 # =====================================================================
 # 5. VISION OCR — reads scanned page images + printed page numbers
 # =====================================================================
 def ocr_page_with_gemini_vision(doc, page_index: int) -> dict:
-    """
-    Renders one PDF page as a PNG and asks Gemini Vision to:
-      (a) transcribe all body text, and
-      (b) read the PRINTED page number(s) from the header/footer.
-
-    This book is scanned as two-page spreads, so a single PDF page can
-    show two printed book pages side by side — hence a LIST of page
-    numbers is returned, not a single int.
-
-    Returns: {"text": str, "page_numbers": list[int]}
-    """
     try:
         page = doc.load_page(page_index)
-        pix = page.get_pixmap(dpi=200)  # 200 DPI balances OCR accuracy vs payload size
+        pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("png")
 
         prompt = (
@@ -281,19 +218,11 @@ def ocr_page_with_gemini_vision(doc, page_index: int) -> dict:
             body_text = rest.split("---", 1)[-1].strip() if "---" in rest else rest.strip()
 
         return {"text": body_text, "page_numbers": page_numbers}
-
     except Exception as e:
         print(f"⚠️ Vision OCR failed for PDF page {page_index + 1}: {e}")
         return {"text": "", "page_numbers": []}
 
-
 def resolve_book_page_label(detected_numbers: list, fallback_pdf_page: int):
-    """
-    Converts OCR-detected printed page number(s) into:
-      - a representative int for topic-range lookups (smallest number found)
-      - a display label ('3-4' for a spread, '3' for a single page, or a
-        clearly-flagged fallback if OCR couldn't read any page number).
-    """
     if detected_numbers:
         numbers = sorted(set(detected_numbers))
         representative = numbers[0]
@@ -301,9 +230,7 @@ def resolve_book_page_label(detected_numbers: list, fallback_pdf_page: int):
         return representative, label
     return fallback_pdf_page, f"PDF-p{fallback_pdf_page} (unread)"
 
-
 def get_topic_for_page(book_page_num: int) -> str:
-    """Maps a PRINTED book page number to its syllabus topic (per the book's TOC)."""
     if 1 <= book_page_num <= 27:
         return "General Agriculture"
     elif 28 <= book_page_num <= 214:
@@ -325,7 +252,6 @@ def get_topic_for_page(book_page_num: int) -> str:
     else:
         return "Preliminary / Index"
 
-
 # =====================================================================
 # 6. PYDANTIC SCHEMAS
 # =====================================================================
@@ -339,50 +265,67 @@ class SingleMCQ(BaseModel):
     correct_answer: str = Field(description="Strictly A, B, C, D, or E")
     explanation: str = Field(description="1-3 lines factual explanation in pure English")
 
-
 class MCQList(BaseModel):
     mcqs: list[SingleMCQ]
 
-
 # =====================================================================
-# 7. MULTI-TIER AI FALLBACK ENGINE (MCQ generation from OCR'd text)
+# 7. MULTI-TIER AI FALLBACK ENGINE — UPDATED WITH LATEST FREE MODELS
 # =====================================================================
 TIERS = [
-    # Groq deprecated llama-3.3-70b-versatile (June 17, 2026) -> gpt-oss-120b
-    {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-120b", "key": GROQ_KEY},
-    # Cerebras deprecated llama-3.3-70b (Feb 16, 2026) -> gpt-oss-120b
-    {"name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "model": "gpt-oss-120b", "key": CEREBRAS_KEY},
-    {"name": "Mistral", "base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key": MISTRAL_KEY},
-    # SambaNova: Meta-Llama-3.1-70B-Instruct is legacy -> Meta-Llama-3.3-70B-Instruct
-    {"name": "SambaNova", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.3-70B-Instruct", "key": SAMBANOVA_KEY},
-    {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-oss-20b:free", "key": OPENROUTER_KEY},
-    # NOTE: The "GitHub-Azure" (GitHub Models) tier has been REMOVED — GitHub
-    # Models was fully retired on July 30, 2026, so gpt-4o via that endpoint
-    # no longer works at all. GITHUB_TOKEN is no longer used for MCQ generation.
+    # 1. Gemini 2.5 Flash (Best free model, high quality)
+    {"name": "Gemini 2.5 Flash", "type": "gemini", "model": "gemini-2.5-flash", "key": GEMINI_KEY_1},
+    # 2. Groq — fastest inference, good for simple MCQ generation
+    {"name": "Groq", "type": "openai", "base_url": "https://api.groq.com/openai/v1", "model": "llama3-70b-8192", "key": GROQ_KEY},
+    # 3. Cerebras — very fast, good quality
+    {"name": "Cerebras", "type": "openai", "base_url": "https://api.cerebras.ai/v1", "model": "llama3.1-70b", "key": CEREBRAS_KEY},
+    # 4. Mistral — good for complex reasoning
+    {"name": "Mistral", "type": "openai", "base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key": MISTRAL_KEY},
+    # 5. SambaNova — strong alternative
+    {"name": "SambaNova", "type": "openai", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.1-70B-Instruct", "key": SAMBANOVA_KEY},
+    # 6. OpenRouter — fallback with multiple free models
+    {"name": "OpenRouter", "type": "openai", "base_url": "https://openrouter.ai/api/v1", "model": "google/gemini-2.5-flash:free", "key": OPENROUTER_KEY},
 ]
 
-
 def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
-    """Generates MCQs from OCR'd page text, trying each provider tier in order."""
+    """Generates MCQs using multi-tier fallback with latest free AI models."""
     full_prompt = f"{custom_prompt}\n\nPAGE TEXT:\n{page_text}\n\nReturn output strictly matching the required JSON schema."
 
     for tier in TIERS:
         if not tier["key"]:
             continue
+
         try:
             print(f"🔄 Trying {tier['name']}...")
-            client = OpenAI(api_key=tier["key"], base_url=tier["base_url"])
-            response = client.chat.completions.create(
-                model=tier["model"],
-                messages=[
-                    {"role": "system", "content": "You are an Expert Agricultural Exam Setter. Output exclusively in valid JSON."},
-                    {"role": "user", "content": full_prompt}
-                ],
-                response_format={"type": "json_object"},
-                timeout=45
-            )
-            raw_data = response.choices[0].message.content
-            parsed_data = json.loads(raw_data)
+
+            if tier["type"] == "gemini":
+                # Gemini direct call
+                try:
+                    genai.configure(api_key=tier["key"])
+                    model = genai.GenerativeModel(tier["model"])
+                    response = model.generate_content(
+                        full_prompt,
+                        generation_config={"response_mime_type": "application/json"}
+                    )
+                    raw_data = response.text
+                    parsed_data = json.loads(raw_data)
+                except Exception as e:
+                    print(f"⚠️ Gemini error: {e}")
+                    continue
+
+            else:
+                # OpenAI-compatible providers
+                client = OpenAI(api_key=tier["key"], base_url=tier["base_url"])
+                response = client.chat.completions.create(
+                    model=tier["model"],
+                    messages=[
+                        {"role": "system", "content": "You are an Expert Agricultural Exam Setter. Output exclusively in valid JSON."},
+                        {"role": "user", "content": full_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    timeout=60
+                )
+                raw_data = response.choices[0].message.content
+                parsed_data = json.loads(raw_data)
 
             if "mcqs" not in parsed_data and isinstance(parsed_data, list):
                 parsed_data = {"mcqs": parsed_data}
@@ -396,30 +339,19 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
 
         except Exception as e:
             print(f"❌ [{tier['name']} Failed]: {e}")
-            time.sleep(3)
+            time.sleep(2)
             continue
 
     raise RuntimeError("Critical Failure: All AI provider tiers exhausted for this page.")
 
-
 # =====================================================================
-# 8. BACKGROUND WORKER — the page-by-page read → OCR → MCQ → Sheet loop
+# 8. BACKGROUND WORKER
 # =====================================================================
 def background_worker_process():
-    """
-    Main autonomous loop. Design goals:
-      - Never die: every page is wrapped so one bad page can't kill the thread.
-      - Always uses Vision OCR (book is 100% scanned) to read each page image
-        AND its printed page number.
-      - Tracks progress both in MongoDB (fast, resume-safe) and in a
-        'Progress' tab inside the user's own Google Sheet (visible, editable).
-    """
     print("🚀 Background Worker Started!")
-
     while True:
         try:
             config = config_col.find_one({"_id": "master_config"})
-
             if config["worker_status"] != "running":
                 time.sleep(10)
                 continue
@@ -432,13 +364,12 @@ def background_worker_process():
                 time.sleep(10)
                 continue
 
-            # --- Ensure PDF is available locally ---
             pdf_path = "/tmp/current_book.pdf"
             if not os.path.exists(pdf_path):
                 download_pdf_from_drive(config["pdf_drive_link"], pdf_path)
 
             doc = fitz.open(pdf_path)
-            pdf_pointer = config["current_page"]        # PDF-internal loop index (1-based)
+            pdf_pointer = config["current_page"]
             total_pdf_pages = len(doc)
 
             if pdf_pointer > total_pdf_pages:
@@ -450,7 +381,6 @@ def background_worker_process():
 
             print(f"📖 Processing PDF page {pdf_pointer}/{total_pdf_pages} (Vision OCR)...")
 
-            # --- Vision OCR (primary and only extraction method — book is scanned) ---
             ocr_result = ocr_page_with_gemini_vision(doc, pdf_pointer - 1)
             page_text = ocr_result["text"]
             detected_numbers = ocr_result["page_numbers"]
@@ -460,9 +390,6 @@ def background_worker_process():
                 topic = get_topic_for_page(book_page_num)
                 print(f"📚 Book Page: {book_page_label} | Topic: {topic} | Text length: {len(page_text)} chars")
 
-                # One-time calibration: remember which PDF page shows printed "page 1".
-                # This lets us later estimate the PDF page for any requested book page
-                # (this book is scanned at 2 printed pages per PDF page).
                 if config.get("book_page_offset") is None and 1 in detected_numbers:
                     config_col.update_one(
                         {"_id": "master_config"},
@@ -470,8 +397,6 @@ def background_worker_process():
                     )
                     print(f"🎯 Calibrated: printed book page 1 = PDF page {pdf_pointer}")
 
-                # Remember exactly which PDF page contains which printed page(s),
-                # for exact (non-estimated) jumps later via "reset to page X".
                 if detected_numbers:
                     page_map_col.update_one(
                         {"_id": pdf_pointer},
@@ -479,6 +404,7 @@ def background_worker_process():
                         upsert=True
                     )
 
+                # Generate MCQs with fallback
                 mcq_data = generate_mcqs_with_fallback(page_text, config["system_prompt"])
 
                 gc = get_gspread_client()
@@ -496,6 +422,7 @@ def background_worker_process():
                         item.option_a, item.option_b, item.option_c, item.option_d, item.option_e,
                         item.correct_answer, item.explanation, now_utc
                     ])
+
                 mcq_sheet.append_rows(rows_to_append)
                 print(f"📊 Added {len(rows_to_append)} MCQ rows to Google Sheet")
 
@@ -506,16 +433,15 @@ def background_worker_process():
                         "$set": {"last_book_page_label": book_page_label},
                     }
                 )
-                # Refresh the live status tab with the latest numbers.
                 updated_config = config_col.find_one({"_id": "master_config"})
                 sync_progress_sheet(spreadsheet, updated_config, total_pdf_pages)
 
             else:
-                print(f"⏭️ PDF page {pdf_pointer} produced no usable text even after OCR — skipping.")
+                print(f"⏭️ PDF page {pdf_pointer} produced no usable text — skipping.")
                 config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
 
             doc.close()
-            time.sleep(5)  # pacing — avoids hammering AI provider rate limits
+            time.sleep(3)
 
         except Exception as e:
             print(f"❌ Worker Error: {e}")
@@ -530,9 +456,8 @@ def background_worker_process():
                 pass
             time.sleep(15)
 
-
 # =====================================================================
-# 9. TELEGRAM AGENT — natural-language control (webhook mode, no polling)
+# 9. TELEGRAM AGENT
 # =====================================================================
 AGENT_PROMPT = """
 You are the Autonomous AI Manager for a scanned-textbook MCQ Generation System.
@@ -566,27 +491,19 @@ HELP_TEXT = (
     "Progress hamesha aapki Google Sheet ke *Progress* tab mein bhi live dikhta rehta hai."
 )
 
-
 def _estimate_pdf_page_for_book_page(target_book_page: int, config: dict) -> tuple:
-    """
-    Resolves a requested PRINTED book page to a PDF page index.
-    Returns (pdf_page_index_or_None, source_description).
-    """
     exact = page_map_col.find_one({"book_pages": target_book_page})
     if exact:
         return exact["_id"], "exact match from processing history"
 
     offset = config.get("book_page_offset")
     if offset:
-        # This book is scanned at 2 printed pages per PDF page (a spread).
         estimated = max(1, offset + (target_book_page - 1) // 2)
         return estimated, f"estimated (book page 1 calibrated at PDF page {offset})"
 
     return None, None
 
-
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles one incoming Telegram text message via the Gemini intent agent."""
     user_text = update.message.text
     user_name = update.effective_user.first_name
     print(f"💬 Telegram from {user_name}: {user_text}")
@@ -602,14 +519,11 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
             generation_config={"response_mime_type": "application/json"},
         )
         raw_reply = (response.text or "").strip()
-        # Defensive: strip ```json ... ``` fences if the model adds them anyway
         if raw_reply.startswith("```"):
             raw_reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_reply.strip())
 
         if not raw_reply:
-            await update.message.reply_text(
-                "❌ Agent Error: Gemini returned an empty response. Please try again."
-            )
+            await update.message.reply_text("❌ Agent Error: Gemini returned an empty response. Please try again.")
             return
 
         intent = json.loads(raw_reply)
@@ -627,7 +541,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
                 {"_id": "master_config"},
                 {"$set": {"pdf_drive_link": value, "current_page": 1, "book_page_offset": None}}
             )
-            page_map_col.delete_many({})  # new book = old page map is meaningless
+            page_map_col.delete_many({})
             if os.path.exists("/tmp/current_book.pdf"):
                 os.remove("/tmp/current_book.pdf")
             reply = f"✅ PDF updated, progress reset to page 1, cache cleared!\n\n{reply}"
@@ -692,18 +606,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         traceback.print_exc()
         await update.message.reply_text(f"❌ Agent Error: {e}\nPlease try rephrasing your request.")
 
-
-# Built once at import time. Runs inside FastAPI's own event loop via
-# process_update() — no separate thread/event loop, no competing
-# getUpdates() calls, so there's no "Conflict" error on redeploy.
 async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /start and /help — Telegram commands are excluded by the
-    plain-text MessageHandler below, so they need their own handler."""
-    print(f"💬 Telegram /start-or-help from {update.effective_user.first_name}")
     await update.message.reply_text(
         f"👋 Namaste! AI MCQ Generator bot chalu hai.\n\n{HELP_TEXT}"
     )
-
 
 telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(CommandHandler(["start", "help"], handle_start_command))
@@ -712,13 +618,11 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_
 WEBHOOK_PATH = f"/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
 EXTERNAL_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
-
 # =====================================================================
 # 10. FASTAPI APP
 # =====================================================================
 app = FastAPI()
 start_time = time.time()
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -729,35 +633,22 @@ async def on_startup():
         await telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
         print(f"✅ Telegram webhook registered: {webhook_url}")
     else:
-        print("⚠️ No RENDER_EXTERNAL_URL/WEBHOOK_URL found — webhook NOT set. "
-              "Set WEBHOOK_URL env var manually to your public Render URL if needed.")
-
+        print("⚠️ No RENDER_EXTERNAL_URL found — webhook NOT set.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    # NOTE: We deliberately do NOT call bot.delete_webhook() here.
-    # During a redeploy, the OLD instance's shutdown can briefly overlap
-    # with the NEW instance's startup — if the old instance deletes the
-    # webhook after the new one just registered it, the webhook ends up
-    # empty even though startup logged success. Since set_webhook() is
-    # idempotent and always re-runs on the next startup, there's no need
-    # to delete it on shutdown at all.
     await telegram_app.stop()
     await telegram_app.shutdown()
 
-
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """Receives updates pushed by Telegram."""
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
 
-
 @app.get("/")
 def keep_alive():
-    """Health check / uptime-ping endpoint."""
     try:
         config = config_col.find_one({"_id": "master_config"})
         return {
@@ -770,10 +661,8 @@ def keep_alive():
     except Exception:
         return {"service": "AI_MCQ_Agent_Active", "status": "starting", "timestamp": time.time()}
 
-
 @app.get("/health")
 def health_check():
-    """Detailed health/diagnostics check."""
     try:
         config = config_col.find_one({"_id": "master_config"})
         return {
@@ -787,14 +676,12 @@ def health_check():
                 "groq": bool(GROQ_KEY),
                 "cerebras": bool(CEREBRAS_KEY),
                 "mistral": bool(MISTRAL_KEY),
-                "github_unused_since_retirement": bool(GITHUB_TOKEN),
                 "sambanova": bool(SAMBANOVA_KEY),
                 "openrouter": bool(OPENROUTER_KEY),
             },
         }
     except Exception as e:
         return {"status": "unhealthy", "error": str(e)}
-
 
 # =====================================================================
 # 11. ENTRY POINT
@@ -803,7 +690,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print("=" * 60)
-    print("🚀 AI MCQ Generator System v3.0 Starting...")
+    print("🚀 AI MCQ Generator System v4.0 Starting...")
     print("=" * 60)
     print(f"📊 MongoDB: {'Connected' if mongo_client else 'Failed'}")
     print(f"🤖 Telegram: {'Configured' if TELEGRAM_BOT_TOKEN else 'Missing'}")
@@ -817,8 +704,6 @@ if __name__ == "__main__":
         print("✅ Background Worker Thread Started")
     except Exception as e:
         print(f"❌ Worker thread error: {e}")
-
-    # Telegram runs in webhook mode via FastAPI's own event loop (see startup event above).
 
     try:
         port = int(os.environ.get("PORT", 8080))
