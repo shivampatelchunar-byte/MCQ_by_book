@@ -348,12 +348,17 @@ class MCQList(BaseModel):
 # 7. MULTI-TIER AI FALLBACK ENGINE (MCQ generation from OCR'd text)
 # =====================================================================
 TIERS = [
-    {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile", "key": GROQ_KEY},
-    {"name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "model": "llama-3.3-70b", "key": CEREBRAS_KEY},
+    # Groq deprecated llama-3.3-70b-versatile (June 17, 2026) -> gpt-oss-120b
+    {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-120b", "key": GROQ_KEY},
+    # Cerebras deprecated llama-3.3-70b (Feb 16, 2026) -> gpt-oss-120b
+    {"name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "model": "gpt-oss-120b", "key": CEREBRAS_KEY},
     {"name": "Mistral", "base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key": MISTRAL_KEY},
-    {"name": "GitHub-Azure", "base_url": "https://models.inference.ai.azure.com", "model": "gpt-4o", "key": GITHUB_TOKEN},
-    {"name": "SambaNova", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.1-70B-Instruct", "key": SAMBANOVA_KEY},
+    # SambaNova: Meta-Llama-3.1-70B-Instruct is legacy -> Meta-Llama-3.3-70B-Instruct
+    {"name": "SambaNova", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.3-70B-Instruct", "key": SAMBANOVA_KEY},
     {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-oss-20b:free", "key": OPENROUTER_KEY},
+    # NOTE: The "GitHub-Azure" (GitHub Models) tier has been REMOVED — GitHub
+    # Models was fully retired on July 30, 2026, so gpt-4o via that endpoint
+    # no longer works at all. GITHUB_TOKEN is no longer used for MCQ generation.
 ]
 
 
@@ -782,7 +787,7 @@ def health_check():
                 "groq": bool(GROQ_KEY),
                 "cerebras": bool(CEREBRAS_KEY),
                 "mistral": bool(MISTRAL_KEY),
-                "github": bool(GITHUB_TOKEN),
+                "github_unused_since_retirement": bool(GITHUB_TOKEN),
                 "sambanova": bool(SAMBANOVA_KEY),
                 "openrouter": bool(OPENROUTER_KEY),
             },
