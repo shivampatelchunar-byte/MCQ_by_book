@@ -36,6 +36,9 @@ except ImportError:  # Allows the service to start health diagnostics cleanly.
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mcq_generator")
+# python-telegram-bot uses httpx; its INFO logs include the complete request
+# URL, which contains the Telegram bot token. Never emit those URLs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def env(name: str, *, required: bool = False, default: str = "") -> str:
@@ -63,7 +66,9 @@ if not ALLOWED_USERS:
     raise RuntimeError("TELEGRAM_ALLOWED_USER_IDS cannot be empty")
 GCP_SERVICE_ACCOUNT_JSON = env("GCP_SERVICE_ACCOUNT_JSON", required=True)
 GEMINI_KEYS = [key for key in (env("GEMINI_API_KEY_1"), env("GEMINI_API_KEY_2")) if key]
-GEMINI_MODEL = env("GEMINI_MODEL", default="gemini-2.0-flash")
+_requested_gemini_model = env("GEMINI_MODEL", default="gemini-3.6-flash")
+# Gemini retired this model; tolerate an old Render setting during migration.
+GEMINI_MODEL = "gemini-3.6-flash" if _requested_gemini_model in {"gemini-2.0-flash", "gemini-2.0-flash-001"} else _requested_gemini_model
 MAX_PDF_MB = int(env("MAX_PDF_MB", default="80"))
 OCR_DPI = int(env("OCR_DPI", default="160"))
 LEASE_SECONDS = int(env("WORKER_LEASE_SECONDS", default="120"))
@@ -404,3 +409,15 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
 def health():
     mongo.admin.command("ping")
     return {"status": "ok", "providers_configured": [x["name"] for x in configured_providers()]}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "health": "/health"}
+
+
+if __name__ == "__main__":
+    # Keeps direct `python main.py` deployments working; Render should still
+    # preferably use the explicit uvicorn start command in render.yaml.
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
