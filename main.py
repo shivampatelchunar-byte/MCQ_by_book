@@ -112,7 +112,22 @@ def default_config(chat_id: int) -> dict[str, Any]:
 
 def get_config(chat_id: int) -> dict[str, Any]:
     configs.update_one({"_id": config_id(chat_id)}, {"$setOnInsert": default_config(chat_id)}, upsert=True)
-    return configs.find_one({"_id": config_id(chat_id)})
+    config = configs.find_one({"_id": config_id(chat_id)})
+    # Existing deployments created before run_id was introduced need a safe migration.
+    if not config.get("run_id"):
+        run_id = uuid.uuid4().hex
+        configs.update_one({"_id": config["_id"], "run_id": {"$exists": False}}, {"$set": {"run_id": run_id, "updated_at": now()}})
+        config = configs.find_one({"_id": config_id(chat_id)})
+    return config
+
+
+def migrate_legacy_configs() -> None:
+    """Give pre-run_id Mongo configuration documents a generation before workers claim them."""
+    for config in configs.find({"run_id": {"$exists": False}}, {"_id": 1}):
+        configs.update_one(
+            {"_id": config["_id"], "run_id": {"$exists": False}},
+            {"$set": {"run_id": uuid.uuid4().hex, "updated_at": now()}},
+        )
 
 
 def normalize_service_account_json(raw: str) -> dict[str, Any]:
@@ -187,9 +202,17 @@ def credential_state_id(kind: str, model: str, key: str) -> str:
     return f"{kind}:{model}:{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
+def utc_datetime(value: datetime | None) -> datetime | None:
+    """PyMongo returns naive UTC datetimes unless tz_aware=True was requested."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 def credential_available(kind: str, model: str, key: str) -> bool:
     state = provider_state.find_one({"_id": credential_state_id(kind, model, key)}, {"cooldown_until": 1})
-    return not state or state.get("cooldown_until", now()) <= now()
+    cooldown_until = utc_datetime(state.get("cooldown_until")) if state else None
+    return cooldown_until is None or cooldown_until <= now()
 
 
 def cool_down_credential(kind: str, model: str, key: str, seconds: int, reason: str) -> None:
@@ -490,7 +513,7 @@ async def pause(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_user(update): return
     c = await asyncio.to_thread(get_config, update.effective_chat.id)
-    retry = c.get("next_retry_at")
+    retry = utc_datetime(c.get("next_retry_at"))
     retry_text = retry.isoformat() if retry and retry > now() else "—"
     await update.effective_message.reply_text(f"Status: {c['status']}\nPDF page: {c['current_pdf_page']}\nLast page: {c.get('last_page_label') or '—'}\nMCQs: {c['total_questions']}\nRetry after: {retry_text}\nPDF: {'set' if c['pdf_url'] else 'missing'} | Sheet: {'set' if c['sheet_url'] else 'missing'}")
 
@@ -541,6 +564,7 @@ telegram_app.add_handler(CommandHandler("help", help_command))
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     mongo.admin.command("ping")
+    migrate_legacy_configs()
     configs.create_index([("status", ASCENDING), ("next_retry_at", ASCENDING), ("lease_until", ASCENDING)])
     jobs.create_index([("config_id", ASCENDING), ("run_id", ASCENDING), ("pdf_page", ASCENDING)])
     updates.create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
