@@ -1,16 +1,38 @@
+"""
+AI MCQ Generator System — v3.0 (Vision-OCR Edition)
+=====================================================
+
+WORKFLOW
+--------
+1. A SCANNED (image-based) textbook PDF lives in Google Drive.
+2. Every page is rendered as an image and read with Gemini Vision OCR
+   (there is no real text layer to extract, so Vision is the primary path).
+3. Gemini Vision also reads the PRINTED page number from the page's own
+   header/footer — this is what we use for topic-mapping and for the
+   "Book Page" column in the output Sheet. The PDF's own internal page
+   count is NEVER used for anything user-facing; it only drives the
+   read-loop and resume pointer.
+4. MCQs are generated from the OCR'd text via a 6-provider fallback chain.
+5. Results are appended to the user's Google Sheet, and a live "Progress"
+   tab in that SAME spreadsheet is kept up to date after every page, so
+   progress is visible without needing Telegram at all.
+6. A Telegram bot (webhook-based, no polling) lets the user configure the
+   PDF/Sheet, start/pause the worker, and — importantly — say things like
+   "reset to page 45" to resume from a specific PRINTED book page. The
+   system maintains a page-number map + a one-time calibration offset to
+   translate a requested book page into the correct PDF page index.
+"""
+
 import os
-import io
 import re
 import json
 import time
-import asyncio
+import random
 import threading
 import traceback
-from datetime import datetime
-from typing import Optional, List, Tuple, Dict
-from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
 import gspread
-import requests
 import gdown
 import pymupdf as fitz
 from fastapi import FastAPI, Request
@@ -18,96 +40,269 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from google.oauth2.service_account import Credentials
 import google.generativeai as genai
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ============================================================
-# 1. ENVIRONMENT VARIABLES
-# ============================================================
+
+# =====================================================================
+# 1. ENVIRONMENT VARIABLES & SECRETS
+# =====================================================================
 MONGO_URI = os.getenv("MONGO_URI")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
 GEMINI_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 GEMINI_KEY_2 = os.getenv("GEMINI_API_KEY_2")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
+MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
+SAMBANOVA_KEY = os.getenv("SAMBANOVA_API_KEY")
 
-# ============================================================
-# 2. GEMINI MODELS - ONLY FLASH-LITE
-# ============================================================
-GEMINI_MODELS = [
-    {
-        "name": "Gemini 3.5 Flash-Lite",
-        "model": "gemini-1.5-flash",
-        "description": "Fast, efficient, cost-optimized"
-    },
-    {
-        "name": "Gemini 3.1 Flash-Lite", 
-        "model": "gemini-1.5-flash-8b",
-        "description": "Cost-efficient, high-volume"
-    }
-]
+REQUIRED_VARS = {
+    "MONGO_URI": MONGO_URI,
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "GCP_SERVICE_ACCOUNT_JSON": GCP_SERVICE_ACCOUNT_JSON,
+    "GEMINI_API_KEY_1": GEMINI_KEY_1,  # powers BOTH the Vision OCR and the Telegram intent agent
+}
+_missing = [k for k, v in REQUIRED_VARS.items() if not v]
+if _missing:
+    print(f"❌ FATAL: Missing required environment variables: {', '.join(_missing)}")
+    print("   The app will start but core features will fail until these are set on Render.")
 
-GEMINI_KEYS = [key for key in [GEMINI_KEY_1, GEMINI_KEY_2] if key]
 
-if GEMINI_KEYS:
-    genai.configure(api_key=GEMINI_KEYS[0])
-    print(f"✅ Gemini configured with {len(GEMINI_KEYS)} keys")
-    print(f"📚 Models: {', '.join([m['name'] for m in GEMINI_MODELS])}")
-else:
-    print("⚠️ No Gemini keys configured")
-
-# ============================================================
-# 3. MONGODB SETUP
-# ============================================================
+# =====================================================================
+# 2. MONGODB — STATE / RESUME TRACKING
+# =====================================================================
 print("📡 Connecting to MongoDB...")
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["mcq_agent_db"]
-config_col = db["system_config"]
+config_col = db["system_config"]      # single-document master config
+page_map_col = db["page_map"]         # pdf_index -> printed book page(s) seen there
+error_log_col = db["error_logs"]
 
-# Default system prompt
-DEFAULT_PROMPT = """You are an Expert Agricultural Exam Setter with 20+ years of experience.
+DEFAULT_SYSTEM_PROMPT = (
+    "Generate 5 to 10 exam-oriented MCQs from the given text. 60% direct, 40% tricky. "
+    "Output strictly in English. Ensure no consecutive duplicate correct answers."
+)
 
-Generate 5 to 10 exam-oriented MCQs based on the text provided.
-
-RULES:
-- Questions: 1-2 lines, clear, exam language
-- Options: A-D plausible, E always "None of these"
-- 60% direct, 40% tricky questions
-- No consecutive duplicate correct answers
-- Correct answer: strictly A, B, C, D, or E
-- Explanation: 1-3 lines, factual, from text
-
-OUTPUT: Valid JSON only
-{"mcqs": [{"question": "...", "option_a": "...", "option_b": "...", "option_c": "...", "option_d": "...", "option_e": "None of these", "correct_answer": "A", "explanation": "..."}]}"""
-
-if not config_col.find_one({"_id": "master_config"}):
-    print("🆕 Creating initial configuration...")
-    config_col.insert_one({
-        "_id": "master_config",
+# Create the config doc if this is a brand-new deployment.
+config_col.update_one(
+    {"_id": "master_config"},
+    {"$setOnInsert": {
         "sheet_url": "",
         "pdf_drive_link": "",
         "worker_status": "paused",
-        "current_page": 1,
-        "last_processed_pdf_page": 0,
+        "current_page": 1,             # PDF-internal page pointer (loop/resume control ONLY)
+        "book_page_offset": None,      # PDF index where printed book-page "1" was found
+        "last_book_page_label": "",    # e.g. "3-4" — for display only
         "total_questions_generated": 0,
-        "pages_completed": [],
-        "book_pages_mapping": {},
-        "failed_pages": [],
-        "system_prompt": DEFAULT_PROMPT,
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat()
-    })
-    print("✅ Configuration created!")
-else:
-    print("✅ Configuration loaded!")
+        "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    }},
+    upsert=True
+)
+# Safe migration: add any newer fields to a pre-existing config doc without
+# touching progress that's already been made.
+config_col.update_one(
+    {"_id": "master_config", "book_page_offset": {"$exists": False}},
+    {"$set": {"book_page_offset": None}}
+)
+config_col.update_one(
+    {"_id": "master_config", "last_book_page_label": {"$exists": False}},
+    {"$set": {"last_book_page_label": ""}}
+)
+print("✅ Configuration ready!")
 
-# ============================================================
-# 4. TOPIC MAPPING
-# ============================================================
+
+# =====================================================================
+# 3. GEMINI SETUP (Vision OCR + Telegram Intent Agent)
+# =====================================================================
+GEMINI_MODEL_NAME = "gemini-3.6-flash"  # multimodal — handles both text and image input
+vision_model = None
+agent_model = None
+try:
+    genai.configure(api_key=GEMINI_KEY_1)
+    vision_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    agent_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    print("✅ Gemini configured successfully!")
+except Exception as e:
+    print(f"⚠️ Gemini config warning: {e}")
+
+
+def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: float = 5.0):
+    """
+    Calls model.generate_content() with exponential backoff.
+    Rate-limit errors (429 / quota / RESOURCE_EXHAUSTED) get a longer backoff
+    than generic transient errors.
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return model.generate_content(contents)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            is_rate_limit = any(s in msg for s in ("429", "quota", "resource_exhausted", "rate limit"))
+            delay = base_delay * (3 if is_rate_limit else 1) * attempt + random.uniform(0, 2)
+            print(f"⚠️ Gemini call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay:.0f}s")
+            time.sleep(delay)
+    raise last_err
+
+
+# =====================================================================
+# 4. GOOGLE SHEETS & DRIVE TOOLS
+# =====================================================================
+def get_gspread_client():
+    """Authenticated Google Sheets client (service account)."""
+    creds_dict = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+MCQ_SHEET_HEADERS = [
+    "Serial No", "Book Page", "Topic", "Question",
+    "Option A", "Option B", "Option C", "Option D", "Option E",
+    "Correct Answer", "Explanation", "Processed At (UTC)"
+]
+
+
+def get_or_create_worksheet(spreadsheet, title: str, rows: int = 100, cols: int = 12):
+    """Returns the worksheet with this title, creating it if missing."""
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def ensure_mcq_sheet_headers(mcq_sheet):
+    """Writes the header row once, if the sheet is currently empty."""
+    first_row = mcq_sheet.row_values(1)
+    if not first_row:
+        mcq_sheet.update("A1:L1", [MCQ_SHEET_HEADERS])
+
+
+def sync_progress_sheet(spreadsheet, config: dict, total_pdf_pages: int = None):
+    """
+    Writes a live, human-readable status block into a 'Progress' tab of the
+    SAME spreadsheet, so the user can see exactly where the system is
+    without needing Telegram. This is overwritten in place (not appended).
+    """
+    try:
+        progress_ws = get_or_create_worksheet(spreadsheet, "Progress", rows=20, cols=2)
+        pdf_pointer_display = (
+            f"{config.get('current_page', 1)}/{total_pdf_pages}"
+            if total_pdf_pages else str(config.get("current_page", 1))
+        )
+        rows = [
+            ["AI MCQ Generator — Live Status", ""],
+            ["", ""],
+            ["Worker Status", config.get("worker_status", "unknown").upper()],
+            ["PDF Page Pointer (internal)", pdf_pointer_display],
+            ["Last Book Page Processed", config.get("last_book_page_label", "—")],
+            ["Book Page 1 Calibrated At (PDF pg)", config.get("book_page_offset") or "not yet calibrated"],
+            ["Total MCQs Generated", config.get("total_questions_generated", 0)],
+            ["PDF Source Link", config.get("pdf_drive_link", "—")],
+            ["Last Updated (UTC)", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")],
+            ["", ""],
+            ["To resume from a specific printed page, tell the Telegram bot:", ""],
+            ["  \"reset to page 45\"", ""],
+        ]
+        progress_ws.update("A1:B12", rows)
+    except Exception as e:
+        # Progress sync is a nice-to-have — never let it break the worker.
+        print(f"⚠️ Progress sheet sync failed (non-fatal): {e}")
+
+
+def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_book.pdf") -> str:
+    """Downloads a PDF from a Google Drive share link."""
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", drive_link)
+    if not match:
+        raise ValueError("Invalid Google Drive link format — expected '.../d/<FILE_ID>/...'")
+
+    file_id = match.group(1)
+    download_url = f"https://drive.google.com/uc?id={file_id}"
+    print(f"📥 Downloading PDF from Drive: {download_url}")
+    gdown.download(download_url, output_path, quiet=False)
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError("PDF download failed — output file missing or empty.")
+
+    print(f"✅ PDF downloaded successfully: {os.path.getsize(output_path)} bytes")
+    return output_path
+
+
+# =====================================================================
+# 5. VISION OCR — reads scanned page images + printed page numbers
+# =====================================================================
+def ocr_page_with_gemini_vision(doc, page_index: int) -> dict:
+    """
+    Renders one PDF page as a PNG and asks Gemini Vision to:
+      (a) transcribe all body text, and
+      (b) read the PRINTED page number(s) from the header/footer.
+
+    This book is scanned as two-page spreads, so a single PDF page can
+    show two printed book pages side by side — hence a LIST of page
+    numbers is returned, not a single int.
+
+    Returns: {"text": str, "page_numbers": list[int]}
+    """
+    try:
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(dpi=200)  # 200 DPI balances OCR accuracy vs payload size
+        img_bytes = pix.tobytes("png")
+
+        prompt = (
+            "This is a scanned spread from an agriculture exam textbook. It may show "
+            "one or two printed book pages side by side. Respond in EXACTLY this format:\n"
+            "PAGE_NUMBERS: <comma-separated printed page number(s) found in the header/footer "
+            "of the image, left-to-right, digits only, e.g. '3,4'. If no printed page number "
+            "is visible, write NONE.>\n"
+            "---\n"
+            "<all readable body text from the page(s), exactly as written, preserving "
+            "paragraph structure. Ignore scanner watermarks like 'Scanned with...'. "
+            "If genuinely blank, leave this section empty.>"
+        )
+        response = call_gemini_with_retry(
+            vision_model, [prompt, {"mime_type": "image/png", "data": img_bytes}]
+        )
+        raw = (response.text or "").strip()
+
+        page_numbers, body_text = [], raw
+        if raw.upper().startswith("PAGE_NUMBERS:"):
+            header_line, _, rest = raw.partition("\n")
+            nums_part = header_line.split(":", 1)[1].strip()
+            if nums_part.upper() != "NONE":
+                page_numbers = [int(n) for n in re.findall(r"\d+", nums_part)]
+            body_text = rest.split("---", 1)[-1].strip() if "---" in rest else rest.strip()
+
+        return {"text": body_text, "page_numbers": page_numbers}
+
+    except Exception as e:
+        print(f"⚠️ Vision OCR failed for PDF page {page_index + 1}: {e}")
+        return {"text": "", "page_numbers": []}
+
+
+def resolve_book_page_label(detected_numbers: list, fallback_pdf_page: int):
+    """
+    Converts OCR-detected printed page number(s) into:
+      - a representative int for topic-range lookups (smallest number found)
+      - a display label ('3-4' for a spread, '3' for a single page, or a
+        clearly-flagged fallback if OCR couldn't read any page number).
+    """
+    if detected_numbers:
+        numbers = sorted(set(detected_numbers))
+        representative = numbers[0]
+        label = f"{numbers[0]}-{numbers[-1]}" if len(numbers) > 1 else str(numbers[0])
+        return representative, label
+    return fallback_pdf_page, f"PDF-p{fallback_pdf_page} (unread)"
+
+
 def get_topic_for_page(book_page_num: int) -> str:
-    if book_page_num is None or book_page_num < 1:
-        return "Unknown"
-    elif 2 <= book_page_num <= 27:
+    """Maps a PRINTED book page number to its syllabus topic (per the book's TOC)."""
+    if 1 <= book_page_num <= 27:
         return "General Agriculture"
     elif 28 <= book_page_num <= 214:
         return "Agronomy"
@@ -116,584 +311,489 @@ def get_topic_for_page(book_page_num: int) -> str:
     elif 319 <= book_page_num <= 338:
         return "Agrometeorology"
     elif 339 <= book_page_num <= 407:
-        return "Animal Husbandry"
+        return "Animal Husbandry and Dairy Science"
     elif 408 <= book_page_num <= 466:
         return "Agricultural Extension"
     elif 467 <= book_page_num <= 540:
         return "Agricultural Economics"
     elif 541 <= book_page_num <= 571:
         return "Agricultural Statistics"
-    elif 572 <= book_page_num <= 601:
+    elif book_page_num >= 572:
         return "Agricultural Engineering"
     else:
-        return "General"
+        return "Preliminary / Index"
 
-# ============================================================
-# 5. GOOGLE SHEETS & DRIVE
-# ============================================================
-def get_gspread_client():
-    try:
-        creds_dict = json.loads(GCP_SERVICE_ACCOUNT_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", 
-                  "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(creds)
-    except Exception as e:
-        print(f"❌ Google Sheets auth error: {e}")
-        raise
 
-def download_pdf_from_drive(drive_link: str, output_path: str = "/tmp/current_book.pdf"):
-    try:
-        patterns = [
-            r"/d/([a-zA-Z0-9_-]+)",
-            r"id=([a-zA-Z0-9_-]+)",
-            r"file/d/([a-zA-Z0-9_-]+)"
-        ]
-        
-        file_id = None
-        for pattern in patterns:
-            match = re.search(pattern, drive_link)
-            if match:
-                file_id = match.group(1)
-                break
-        
-        if not file_id:
-            raise ValueError("Invalid Google Drive Link format")
-        
-        download_url = f"https://drive.google.com/uc?id={file_id}"
-        print(f"📥 Downloading PDF...")
-        gdown.download(download_url, output_path, quiet=False)
-        
-        if os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            print(f"✅ PDF downloaded: {file_size/1024/1024:.2f} MB")
-            return output_path
-        else:
-            raise Exception("PDF download failed")
-            
-    except Exception as e:
-        print(f"❌ PDF download error: {e}")
-        raise
-
-# ============================================================
-# 6. GEMINI VISION - EXTRACT TEXT & PAGE NUMBER
-# ============================================================
-def extract_page_with_gemini_vision(doc, page_index: int) -> Dict:
-    for gemini_model in GEMINI_MODELS:
-        for key_idx in range(len(GEMINI_KEYS)):
-            try:
-                if key_idx > 0:
-                    genai.configure(api_key=GEMINI_KEYS[key_idx])
-                
-                vision_model = genai.GenerativeModel(gemini_model['model'])
-                
-                page = doc.load_page(page_index)
-                pix = page.get_pixmap(dpi=200)
-                img_bytes = pix.tobytes("png")
-                
-                response = vision_model.generate_content([
-                    """
-                    IMPORTANT: This is a scanned page from an agriculture textbook.
-                    
-                    TASKS:
-                    1. Find the PRINTED PAGE NUMBER in the header or footer.
-                       - Look for numbers like "Page 123", "123", or "- 123 -"
-                    
-                    2. Extract ALL readable body text from this page.
-                       - Preserve paragraph structure
-                       - Ignore scanner watermarks
-                    
-                    RESPOND IN THIS EXACT FORMAT:
-                    PAGE_NUMBERS: <comma-separated numbers found>
-                    
-                    ---
-                    <extracted body text here>
-                    """,
-                    {"mime_type": "image/png", "data": img_bytes}
-                ])
-                
-                raw = (response.text or "").strip()
-                
-                book_page_number = None
-                body_text = raw
-                
-                if "PAGE_NUMBERS:" in raw.upper():
-                    parts = raw.upper().split("PAGE_NUMBERS:", 1)
-                    if len(parts) > 1:
-                        num_line = parts[1].split("---", 1)[0].strip()
-                        numbers = re.findall(r'\b(\d{1,4})\b', num_line)
-                        if numbers:
-                            book_page_number = int(numbers[0])
-                            print(f"📄 Found book page number: {book_page_number}")
-                        
-                        if "---" in raw:
-                            body_text = raw.split("---", 1)[1].strip()
-                        else:
-                            body_text = raw
-                
-                if book_page_number is None:
-                    first_chars = raw[:300]
-                    numbers = re.findall(r'\b(\d{1,4})\b', first_chars)
-                    for num in numbers:
-                        n = int(num)
-                        if 1 <= n <= 1000 and n not in [2024, 2025, 2026]:
-                            book_page_number = n
-                            print(f"📄 Detected possible page number: {book_page_number}")
-                            break
-                
-                if len(body_text) > 50:
-                    return {
-                        "text": body_text,
-                        "book_page_number": book_page_number
-                    }
-                    
-            except Exception as e:
-                print(f"⚠️ OCR failed: {str(e)[:80]}")
-                time.sleep(1)
-                continue
-    
-    return {"text": "", "book_page_number": None}
-
-# ============================================================
-# 7. PYDANTIC SCHEMAS
-# ============================================================
+# =====================================================================
+# 6. PYDANTIC SCHEMAS
+# =====================================================================
 class SingleMCQ(BaseModel):
-    question: str
-    option_a: str
-    option_b: str
-    option_c: str
-    option_d: str
-    option_e: str = "None of these"
-    correct_answer: str
-    explanation: str
+    question: str = Field(description="1-2 lines concise exam-oriented question")
+    option_a: str = Field(description="Option A")
+    option_b: str = Field(description="Option B")
+    option_c: str = Field(description="Option C")
+    option_d: str = Field(description="Option D")
+    option_e: str = Field(default="None of these", description="Always 'None of these'")
+    correct_answer: str = Field(description="Strictly A, B, C, D, or E")
+    explanation: str = Field(description="1-3 lines factual explanation in pure English")
+
 
 class MCQList(BaseModel):
-    mcqs: List[SingleMCQ]
+    mcqs: list[SingleMCQ]
 
-# ============================================================
-# 8. GEMINI MCQ GENERATOR
-# ============================================================
-def generate_mcqs_with_gemini(page_text: str, custom_prompt: str) -> MCQList:
-    page_text = page_text[:12000]
-    full_prompt = f"""{custom_prompt}
 
-PAGE TEXT:
-{page_text}"""
-    
-    for gemini_model in GEMINI_MODELS:
-        for key_idx in range(len(GEMINI_KEYS)):
-            try:
-                if key_idx > 0:
-                    genai.configure(api_key=GEMINI_KEYS[key_idx])
-                
-                model = genai.GenerativeModel(gemini_model['model'])
-                
-                response = model.generate_content(
-                    full_prompt,
-                    generation_config={
-                        "temperature": 0.3,
-                        "top_p": 0.95,
-                        "top_k": 40,
-                        "max_output_tokens": 8192,
-                        "response_mime_type": "application/json"
-                    }
-                )
-                
-                raw_data = response.text.strip()
-                raw_data = re.sub(r'^```json\s*', '', raw_data)
-                raw_data = re.sub(r'\s*```$', '', raw_data)
-                
-                parsed_data = json.loads(raw_data)
-                
-                if "mcqs" not in parsed_data and isinstance(parsed_data, list):
-                    parsed_data = {"mcqs": parsed_data}
-                elif "mcqs" not in parsed_data:
-                    for key, value in parsed_data.items():
-                        if isinstance(value, list) and len(value) > 0:
-                            parsed_data = {"mcqs": value}
-                            break
-                
-                mcq_list = MCQList(**parsed_data)
-                print(f"✅ {gemini_model['name']} succeeded! Generated {len(mcq_list.mcqs)} MCQs")
-                return mcq_list
-                
-            except Exception as e:
-                print(f"❌ {gemini_model['name']} failed: {str(e)[:100]}")
-                time.sleep(2)
-                continue
-    
-    raise RuntimeError("All Gemini Flash-Lite models failed")
+# =====================================================================
+# 7. MULTI-TIER AI FALLBACK ENGINE (MCQ generation from OCR'd text)
+# =====================================================================
+TIERS = [
+    {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile", "key": GROQ_KEY},
+    {"name": "Cerebras", "base_url": "https://api.cerebras.ai/v1", "model": "llama-3.3-70b", "key": CEREBRAS_KEY},
+    {"name": "Mistral", "base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key": MISTRAL_KEY},
+    {"name": "GitHub-Azure", "base_url": "https://models.inference.ai.azure.com", "model": "gpt-4o", "key": GITHUB_TOKEN},
+    {"name": "SambaNova", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.1-70B-Instruct", "key": SAMBANOVA_KEY},
+    {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-oss-20b:free", "key": OPENROUTER_KEY},
+]
 
-# ============================================================
-# 9. TELEGRAM BOT - HANDLERS
-# ============================================================
-AGENT_PROMPT = """
-You are the AI Manager for MCQ Generator.
 
-Analyze user input and return JSON action.
+def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
+    """Generates MCQs from OCR'd page text, trying each provider tier in order."""
+    full_prompt = f"{custom_prompt}\n\nPAGE TEXT:\n{page_text}\n\nReturn output strictly matching the required JSON schema."
 
-Actions:
-1. update_sheet: user provides Google Sheet URL
-2. update_pdf: user provides Google Drive PDF URL  
-3. start_worker: user says "start", "resume", "begin"
-4. pause_worker: user says "pause", "stop", "halt"
-5. status_report: user asks "status", "progress"
-6. reset_page: user says "reset to page [number]"
-7. general_chat: anything else
-
-Return: {"action": "action_name", "extracted_value": "value", "reply_message": "response"}
-"""
-
-def get_agent_response(user_text: str) -> dict:
-    for gemini_model in GEMINI_MODELS:
-        for key_idx in range(len(GEMINI_KEYS)):
-            try:
-                if key_idx > 0:
-                    genai.configure(api_key=GEMINI_KEYS[key_idx])
-                
-                model = genai.GenerativeModel(gemini_model['model'])
-                
-                response = model.generate_content(
-                    f"{AGENT_PROMPT}\n\nUser: {user_text}",
-                    generation_config={
-                        "temperature": 0.1,
-                        "response_mime_type": "application/json"
-                    }
-                )
-                
-                return json.loads(response.text)
-                
-            except Exception as e:
-                print(f"⚠️ Agent failed: {str(e)[:80]}")
-                continue
-    
-    return {
-        "action": "general_chat",
-        "extracted_value": "",
-        "reply_message": "How can I help? Try: Status?, Start, Pause"
-    }
-
-async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming Telegram messages"""
-    user_text = update.message.text
-    user_name = update.effective_user.first_name
-    print(f"💬 Telegram from {user_name}: {user_text}")
-    
-    try:
-        # Send "typing" indicator
-        await update.message.chat.send_action(action="typing")
-        
-        # Get intent
-        intent = get_agent_response(user_text)
-        action = intent.get("action")
-        value = intent.get("extracted_value", "")
-        reply = intent.get("reply_message", "Done")
-        
-        config = config_col.find_one({"_id": "master_config"})
-        
-        if action == "update_sheet":
-            config_col.update_one({"_id": "master_config"}, {"$set": {"sheet_url": value}})
-            reply = f"✅ Google Sheet updated!\n\n{reply}"
-            
-        elif action == "update_pdf":
-            config_col.update_one({"_id": "master_config"}, {"$set": {"pdf_drive_link": value}})
-            if os.path.exists("/tmp/current_book.pdf"):
-                os.remove("/tmp/current_book.pdf")
-            reply = f"✅ PDF updated!\n\n{reply}"
-            
-        elif action == "start_worker":
-            config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "running"}})
-            current_page = config.get("current_page", 1)
-            reply = f"🚀 Worker started from PDF page {current_page}!\n\n{reply}"
-            
-        elif action == "pause_worker":
-            config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "paused"}})
-            reply = f"⏸️ Worker paused.\n\n{reply}"
-            
-        elif action == "reset_page":
-            try:
-                page_num = int(value)
-                if page_num < 1:
-                    page_num = 1
-                config_col.update_one({"_id": "master_config"}, {"$set": {"current_page": page_num}})
-                reply = f"✅ Reset to PDF page {page_num}\n\n{reply}"
-            except:
-                reply = f"❌ Invalid page number\n\n{reply}"
-            
-        elif action == "status_report":
-            pages_completed = len(config.get("pages_completed", []))
-            mapping = config.get("book_pages_mapping", {})
-            last_pdf = config.get("last_processed_pdf_page", 0)
-            last_book = mapping.get(str(last_pdf), "Unknown")
-            
-            reply = (
-                f"📊 **System Status**\n\n"
-                f"Status: {config['worker_status'].upper()}\n"
-                f"PDF Page: {config['current_page']}\n"
-                f"Last Book Page: {last_book}\n"
-                f"Pages Done: {pages_completed}\n"
-                f"MCQs Generated: {config['total_questions_generated']}\n"
-                f"PDF: {'✅' if config['pdf_drive_link'] else '❌'}\n"
-                f"Sheet: {'✅' if config['sheet_url'] else '❌'}"
+    for tier in TIERS:
+        if not tier["key"]:
+            continue
+        try:
+            print(f"🔄 Trying {tier['name']}...")
+            client = OpenAI(api_key=tier["key"], base_url=tier["base_url"])
+            response = client.chat.completions.create(
+                model=tier["model"],
+                messages=[
+                    {"role": "system", "content": "You are an Expert Agricultural Exam Setter. Output exclusively in valid JSON."},
+                    {"role": "user", "content": full_prompt}
+                ],
+                response_format={"type": "json_object"},
+                timeout=45
             )
-        else:
-            # General chat
-            try:
-                model = genai.GenerativeModel(GEMINI_MODELS[0]['model'])
-                response = model.generate_content(
-                    f"""You are a helpful assistant for MCQ Generator.
-                    Keep response short and friendly.
-                    User: {user_text}"""
-                )
-                reply = response.text
-            except:
-                reply = "How can I help? Try: Status?, Start, Pause"
-        
-        await update.message.reply_text(reply)
-        
-    except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        print(f"❌ Telegram Error: {e}")
-        traceback.print_exc()
-        await update.message.reply_text(error_msg)
+            raw_data = response.choices[0].message.content
+            parsed_data = json.loads(raw_data)
 
-# ============================================================
-# 10. BACKGROUND WORKER
-# ============================================================
+            if "mcqs" not in parsed_data and isinstance(parsed_data, list):
+                parsed_data = {"mcqs": parsed_data}
+
+            mcq_list = MCQList(**parsed_data)
+            if not mcq_list.mcqs:
+                raise ValueError("Provider returned zero MCQs")
+
+            print(f"✅ {tier['name']} succeeded — {len(mcq_list.mcqs)} MCQs")
+            return mcq_list
+
+        except Exception as e:
+            print(f"❌ [{tier['name']} Failed]: {e}")
+            time.sleep(3)
+            continue
+
+    raise RuntimeError("Critical Failure: All AI provider tiers exhausted for this page.")
+
+
+# =====================================================================
+# 8. BACKGROUND WORKER — the page-by-page read → OCR → MCQ → Sheet loop
+# =====================================================================
 def background_worker_process():
+    """
+    Main autonomous loop. Design goals:
+      - Never die: every page is wrapped so one bad page can't kill the thread.
+      - Always uses Vision OCR (book is 100% scanned) to read each page image
+        AND its printed page number.
+      - Tracks progress both in MongoDB (fast, resume-safe) and in a
+        'Progress' tab inside the user's own Google Sheet (visible, editable).
+    """
     print("🚀 Background Worker Started!")
-    
+
     while True:
         try:
             config = config_col.find_one({"_id": "master_config"})
-            
+
             if config["worker_status"] != "running":
                 time.sleep(10)
                 continue
-                
-            if not config["pdf_drive_link"]:
-                print("⚠️ Waiting for PDF link...")
+            if not config["sheet_url"]:
+                print("⚠️ No Google Sheet configured — waiting...")
                 time.sleep(10)
                 continue
-                
-            if not config["sheet_url"]:
-                print("⚠️ Waiting for Sheet link...")
+            if not config["pdf_drive_link"]:
+                print("⚠️ No PDF Drive link configured — waiting...")
                 time.sleep(10)
                 continue
 
+            # --- Ensure PDF is available locally ---
             pdf_path = "/tmp/current_book.pdf"
             if not os.path.exists(pdf_path):
-                print("📥 Downloading PDF...")
                 download_pdf_from_drive(config["pdf_drive_link"], pdf_path)
-            
+
             doc = fitz.open(pdf_path)
-            current_pdf_page = config["current_page"]
-            total_pages = len(doc)
-            
-            print(f"📖 Processing PDF Page {current_pdf_page}/{total_pages}")
-            
-            if current_pdf_page > total_pages:
+            pdf_pointer = config["current_page"]        # PDF-internal loop index (1-based)
+            total_pdf_pages = len(doc)
+
+            if pdf_pointer > total_pdf_pages:
                 print("✅ All pages processed!")
                 config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "completed"}})
                 doc.close()
                 time.sleep(60)
                 continue
 
-            # Extract text and page number
-            print(f"🔍 Scanning PDF page {current_pdf_page}...")
-            result = extract_page_with_gemini_vision(doc, current_pdf_page - 1)
-            
-            page_text = result.get("text", "")
-            book_page_number = result.get("book_page_number", current_pdf_page)
-            
-            if book_page_number is None:
-                book_page_number = current_pdf_page
-                print(f"⚠️ No book page number found, using PDF page {current_pdf_page}")
-            else:
-                print(f"📄 Detected book page: {book_page_number}")
+            print(f"📖 Processing PDF page {pdf_pointer}/{total_pdf_pages} (Vision OCR)...")
 
-            if len(page_text) < 50:
-                print(f"⏭️ Page {current_pdf_page} empty, skipping...")
+            # --- Vision OCR (primary and only extraction method — book is scanned) ---
+            ocr_result = ocr_page_with_gemini_vision(doc, pdf_pointer - 1)
+            page_text = ocr_result["text"]
+            detected_numbers = ocr_result["page_numbers"]
+
+            if len(page_text) > 100:
+                book_page_num, book_page_label = resolve_book_page_label(detected_numbers, pdf_pointer)
+                topic = get_topic_for_page(book_page_num)
+                print(f"📚 Book Page: {book_page_label} | Topic: {topic} | Text length: {len(page_text)} chars")
+
+                # One-time calibration: remember which PDF page shows printed "page 1".
+                # This lets us later estimate the PDF page for any requested book page
+                # (this book is scanned at 2 printed pages per PDF page).
+                if config.get("book_page_offset") is None and 1 in detected_numbers:
+                    config_col.update_one(
+                        {"_id": "master_config"},
+                        {"$set": {"book_page_offset": pdf_pointer}}
+                    )
+                    print(f"🎯 Calibrated: printed book page 1 = PDF page {pdf_pointer}")
+
+                # Remember exactly which PDF page contains which printed page(s),
+                # for exact (non-estimated) jumps later via "reset to page X".
+                if detected_numbers:
+                    page_map_col.update_one(
+                        {"_id": pdf_pointer},
+                        {"$set": {"book_pages": detected_numbers, "topic": topic}},
+                        upsert=True
+                    )
+
+                mcq_data = generate_mcqs_with_fallback(page_text, config["system_prompt"])
+
+                gc = get_gspread_client()
+                spreadsheet = gc.open_by_url(config["sheet_url"])
+                mcq_sheet = spreadsheet.sheet1
+                ensure_mcq_sheet_headers(mcq_sheet)
+
+                start_serial = config["total_questions_generated"] + 1
+                now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+                rows_to_append = []
+                for idx, item in enumerate(mcq_data.mcqs):
+                    rows_to_append.append([
+                        start_serial + idx, book_page_label, topic, item.question,
+                        item.option_a, item.option_b, item.option_c, item.option_d, item.option_e,
+                        item.correct_answer, item.explanation, now_utc
+                    ])
+                mcq_sheet.append_rows(rows_to_append)
+                print(f"📊 Added {len(rows_to_append)} MCQ rows to Google Sheet")
+
                 config_col.update_one(
-                    {"_id": "master_config"}, 
-                    {"$inc": {"current_page": 1}}
-                )
-                doc.close()
-                time.sleep(2)
-                continue
-
-            topic = get_topic_for_page(book_page_number)
-            print(f"📚 Topic: {topic} | Book Page: {book_page_number} | Text: {len(page_text)} chars")
-
-            # Generate MCQs
-            print("🤖 Generating MCQs...")
-            mcq_data = generate_mcqs_with_gemini(page_text, config["system_prompt"])
-            print(f"✅ Generated {len(mcq_data.mcqs)} MCQs")
-
-            # Save to Google Sheet
-            print("📊 Saving to Google Sheet...")
-            gc = get_gspread_client()
-            sheet = gc.open_by_url(config["sheet_url"]).sheet1
-            
-            existing = len(sheet.get_all_values())
-            start_serial = max(1, existing)
-            
-            rows = []
-            for idx, item in enumerate(mcq_data.mcqs):
-                rows.append([
-                    start_serial + idx,
-                    book_page_number,
-                    topic,
-                    item.question,
-                    item.option_a,
-                    item.option_b,
-                    item.option_c,
-                    item.option_d,
-                    item.option_e,
-                    item.correct_answer,
-                    item.explanation,
-                    datetime.now().isoformat(),
-                    current_pdf_page
-                ])
-            
-            sheet.append_rows(rows)
-            print(f"📊 Added {len(rows)} rows")
-
-            # Update progress
-            pages_completed = config.get("pages_completed", [])
-            pages_completed.append(current_pdf_page)
-            
-            book_pages_mapping = config.get("book_pages_mapping", {})
-            book_pages_mapping[str(current_pdf_page)] = book_page_number
-            
-            config_col.update_one(
-                {"_id": "master_config"},
-                {
-                    "$inc": {"current_page": 1, "total_questions_generated": len(rows)},
-                    "$set": {
-                        "last_processed_pdf_page": current_pdf_page,
-                        "pages_completed": pages_completed,
-                        "book_pages_mapping": book_pages_mapping,
-                        "updated_at": datetime.now().isoformat()
+                    {"_id": "master_config"},
+                    {
+                        "$inc": {"current_page": 1, "total_questions_generated": len(rows_to_append)},
+                        "$set": {"last_book_page_label": book_page_label},
                     }
-                }
-            )
-            
+                )
+                # Refresh the live status tab with the latest numbers.
+                updated_config = config_col.find_one({"_id": "master_config"})
+                sync_progress_sheet(spreadsheet, updated_config, total_pdf_pages)
+
+            else:
+                print(f"⏭️ PDF page {pdf_pointer} produced no usable text even after OCR — skipping.")
+                config_col.update_one({"_id": "master_config"}, {"$inc": {"current_page": 1}})
+
             doc.close()
-            print(f"⏳ Waiting 3 seconds...")
-            time.sleep(3)
+            time.sleep(5)  # pacing — avoids hammering AI provider rate limits
 
         except Exception as e:
             print(f"❌ Worker Error: {e}")
             traceback.print_exc()
-            time.sleep(30)
+            try:
+                error_log_col.insert_one({
+                    "timestamp": time.time(),
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                })
+            except Exception:
+                pass
+            time.sleep(15)
 
-# ============================================================
-# 11. FASTAPI APP WITH LIFESPAN EVENTS (FIXED)
-# ============================================================
 
-# Create Telegram app instance
+# =====================================================================
+# 9. TELEGRAM AGENT — natural-language control (webhook mode, no polling)
+# =====================================================================
+AGENT_PROMPT = """
+You are the Autonomous AI Manager for a scanned-textbook MCQ Generation System.
+Analyze the user's natural language input (Hindi/Hinglish/English) and return a
+STRICT JSON object representing the action to take.
+
+Valid actions:
+1. update_sheet: User provided a Google Sheet link. Extract the full URL.
+2. update_pdf: User provided a Google Drive PDF link. Extract the full URL.
+3. update_prompt: User wants to change how MCQs are generated. Extract the new instructions.
+4. start_worker: User wants to start/resume the system from wherever it currently is.
+5. pause_worker: User wants to stop/pause the system.
+6. reset_page: User wants to jump to a specific PRINTED BOOK page number (e.g.
+   "page 45 se start karo", "reset to page 45"). Extract ONLY the digits as extracted_value.
+7. status_report: User is asking for the current status/progress.
+8. help: User is asking what commands/features are available.
+9. general_chat: None of the above, just chat.
+
+Return ONLY this JSON format:
+{"action": "action_name", "extracted_value": "value if applicable, else empty string", "reply_message": "A natural, friendly response to the user confirming the action, in the same language style they used."}
+"""
+
+HELP_TEXT = (
+    "🤖 *Yahan kya-kya bol sakte ho:*\n\n"
+    "• Google Sheet ka link bhejo → output MCQs isi Sheet mein jayenge\n"
+    "• Google Drive PDF ka link bhejo → ye book process hogi\n"
+    "• \"start\" ya \"resume kro\" → worker start/resume\n"
+    "• \"pause\" ya \"stop\" → worker rok do\n"
+    "• \"reset to page 45\" → book ke PRINTED page 45 se dobara start\n"
+    "• \"status\" → abhi kahan tak kaam hua hai\n\n"
+    "Progress hamesha aapki Google Sheet ke *Progress* tab mein bhi live dikhta rehta hai."
+)
+
+
+def _estimate_pdf_page_for_book_page(target_book_page: int, config: dict) -> tuple:
+    """
+    Resolves a requested PRINTED book page to a PDF page index.
+    Returns (pdf_page_index_or_None, source_description).
+    """
+    exact = page_map_col.find_one({"book_pages": target_book_page})
+    if exact:
+        return exact["_id"], "exact match from processing history"
+
+    offset = config.get("book_page_offset")
+    if offset:
+        # This book is scanned at 2 printed pages per PDF page (a spread).
+        estimated = max(1, offset + (target_book_page - 1) // 2)
+        return estimated, f"estimated (book page 1 calibrated at PDF page {offset})"
+
+    return None, None
+
+
+async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles one incoming Telegram text message via the Gemini intent agent."""
+    user_text = update.message.text
+    user_name = update.effective_user.first_name
+    print(f"💬 Telegram from {user_name}: {user_text}")
+
+    if agent_model is None:
+        await update.message.reply_text("❌ AI Agent not configured. Please check GEMINI_API_KEY_1 on the server.")
+        return
+
+    try:
+        response = call_gemini_with_retry(
+            agent_model,
+            f"{AGENT_PROMPT}\n\nUser Input: {user_text}",
+        )
+        intent = json.loads(response.text)
+        action = intent.get("action")
+        value = intent.get("extracted_value", "") or ""
+        reply = intent.get("reply_message", "Action acknowledged.")
+        print(f"🤖 Intent: {action} | Value: {value[:50]}")
+
+        if action == "update_sheet":
+            config_col.update_one({"_id": "master_config"}, {"$set": {"sheet_url": value}})
+            reply = f"✅ Google Sheet updated!\n\n{reply}"
+
+        elif action == "update_pdf":
+            config_col.update_one(
+                {"_id": "master_config"},
+                {"$set": {"pdf_drive_link": value, "current_page": 1, "book_page_offset": None}}
+            )
+            page_map_col.delete_many({})  # new book = old page map is meaningless
+            if os.path.exists("/tmp/current_book.pdf"):
+                os.remove("/tmp/current_book.pdf")
+            reply = f"✅ PDF updated, progress reset to page 1, cache cleared!\n\n{reply}"
+
+        elif action == "update_prompt":
+            config_col.update_one({"_id": "master_config"}, {"$set": {"system_prompt": value}})
+            reply = f"✅ System prompt updated!\n\n{reply}"
+
+        elif action == "start_worker":
+            config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "running"}})
+            reply = f"🚀 Worker started!\n\n{reply}"
+
+        elif action == "pause_worker":
+            config_col.update_one({"_id": "master_config"}, {"$set": {"worker_status": "paused"}})
+            reply = f"⏸️ Worker paused.\n\n{reply}"
+
+        elif action == "reset_page":
+            digits = re.findall(r"\d+", value)
+            if not digits:
+                reply = "⚠️ Page number samajh nahi aaya. Aise likho: \"reset to page 45\""
+            else:
+                target_book_page = int(digits[0])
+                config = config_col.find_one({"_id": "master_config"})
+                new_pdf_index, source = _estimate_pdf_page_for_book_page(target_book_page, config)
+
+                if new_pdf_index:
+                    config_col.update_one(
+                        {"_id": "master_config"},
+                        {"$set": {"current_page": new_pdf_index, "worker_status": "running"}}
+                    )
+                    reply = (
+                        f"🔁 Reset to book page {target_book_page} (PDF page {new_pdf_index}, {source}).\n"
+                        f"Worker resumed. Agar 1-2 page ke baad mapping galat lage, mujhe bata dena."
+                    )
+                else:
+                    reply = (
+                        "⚠️ Abhi tak page-number calibration nahi hui hai (printed 'page 1' abhi tak scan "
+                        "nahi hua). Pehle PDF page 1 se chalne do taaki system offset seekh le, uske baad "
+                        "kisi bhi page pe jump kar sakte ho."
+                    )
+
+        elif action == "status_report":
+            config = config_col.find_one({"_id": "master_config"})
+            reply = (
+                f"📊 *System Status*\n\n"
+                f"Status: {config['worker_status'].upper()}\n"
+                f"PDF Page Pointer: {config['current_page']}\n"
+                f"Last Book Page: {config.get('last_book_page_label') or '—'}\n"
+                f"MCQs Generated: {config['total_questions_generated']}\n"
+                f"PDF: {'✅' if config['pdf_drive_link'] else '❌'}\n"
+                f"Sheet: {'✅' if config['sheet_url'] else '❌'}\n\n"
+                f"(Sheet ke 'Progress' tab mein bhi live status dikhta hai)"
+            )
+
+        elif action == "help":
+            reply = HELP_TEXT
+
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        print(f"❌ Telegram Error: {e}")
+        traceback.print_exc()
+        await update.message.reply_text(f"❌ Agent Error: {e}\nPlease try rephrasing your request.")
+
+
+# Built once at import time. Runs inside FastAPI's own event loop via
+# process_update() — no separate thread/event loop, no competing
+# getUpdates() calls, so there's no "Conflict" error on redeploy.
 telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
 
-WEBHOOK_PATH = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = f"/telegram-webhook/{TELEGRAM_BOT_TOKEN}"
+EXTERNAL_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    print("🚀 Starting up...")
+
+# =====================================================================
+# 10. FASTAPI APP
+# =====================================================================
+app = FastAPI()
+start_time = time.time()
+
+
+@app.on_event("startup")
+async def on_startup():
     await telegram_app.initialize()
     await telegram_app.start()
-    
     if EXTERNAL_URL:
         webhook_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
-        try:
-            await telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-            print(f"✅ Telegram webhook registered: {webhook_url}")
-        except Exception as e:
-            print(f"⚠️ Webhook registration error: {e}")
+        await telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        print(f"✅ Telegram webhook registered: {webhook_url}")
     else:
-        print("⚠️ No RENDER_EXTERNAL_URL found, webhook not set")
-    
-    yield
-    
-    # Shutdown
-    print("🔄 Shutting down...")
+        print("⚠️ No RENDER_EXTERNAL_URL/WEBHOOK_URL found — webhook NOT set. "
+              "Set WEBHOOK_URL env var manually to your public Render URL if needed.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
     try:
         await telegram_app.bot.delete_webhook()
-    except:
+    except Exception:
         pass
     await telegram_app.stop()
+    await telegram_app.shutdown()
 
-app = FastAPI(title="MCQ Generator", version="3.0", lifespan=lifespan)
 
 @app.post(WEBHOOK_PATH)
-async def webhook(request: Request):
-    """Telegram webhook endpoint"""
-    try:
-        data = await request.json()
-        update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.process_update(update)
-        return {"ok": True}
-    except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        return {"ok": False, "error": str(e)}
+async def telegram_webhook(request: Request):
+    """Receives updates pushed by Telegram."""
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
+
 
 @app.get("/")
-def home():
-    config = config_col.find_one({"_id": "master_config"})
-    return {
-        "service": "MCQ Generator v3.0",
-        "status": config["worker_status"],
-        "pdf_page": config["current_page"],
-        "mcqs": config["total_questions_generated"]
-    }
+def keep_alive():
+    """Health check / uptime-ping endpoint."""
+    try:
+        config = config_col.find_one({"_id": "master_config"})
+        return {
+            "service": "AI_MCQ_Agent_Active",
+            "status": config["worker_status"],
+            "current_page": config["current_page"],
+            "total_questions_generated": config["total_questions_generated"],
+            "timestamp": time.time(),
+        }
+    except Exception:
+        return {"service": "AI_MCQ_Agent_Active", "status": "starting", "timestamp": time.time()}
+
 
 @app.get("/health")
-def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+def health_check():
+    """Detailed health/diagnostics check."""
+    try:
+        config = config_col.find_one({"_id": "master_config"})
+        return {
+            "status": "healthy",
+            "uptime_seconds": round(time.time() - start_time),
+            "mongo": "connected",
+            "worker_status": config["worker_status"],
+            "current_page": config["current_page"],
+            "api_keys": {
+                "gemini": bool(GEMINI_KEY_1),
+                "groq": bool(GROQ_KEY),
+                "cerebras": bool(CEREBRAS_KEY),
+                "mistral": bool(MISTRAL_KEY),
+                "github": bool(GITHUB_TOKEN),
+                "sambanova": bool(SAMBANOVA_KEY),
+                "openrouter": bool(OPENROUTER_KEY),
+            },
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
 
-@app.post("/reset/{pdf_page}")
-def reset_to_page(pdf_page: int):
-    if pdf_page < 1:
-        pdf_page = 1
-    config_col.update_one({"_id": "master_config"}, {"$set": {"current_page": pdf_page}})
-    return {"message": f"Reset to page {pdf_page}", "page": pdf_page}
 
-# ============================================================
-# 12. TEST TELEGRAM BOT ENDPOINT
-# ============================================================
-@app.get("/test-webhook")
-def test_webhook():
-    """Test if webhook is working"""
-    return {
-        "webhook_url": f"{EXTERNAL_URL}{WEBHOOK_PATH}",
-        "bot_token": "Configured" if TELEGRAM_BOT_TOKEN else "Missing"
-    }
-
-# ============================================================
-# 13. MAIN ENTRY
-# ============================================================
+# =====================================================================
+# 11. ENTRY POINT
+# =====================================================================
 if __name__ == "__main__":
     import uvicorn
-    
-    print("=" * 70)
-    print("🚀 MCQ Generator v3.0 - FIXED")
-    print("=" * 70)
-    print(f"📊 MongoDB: ✅ Connected")
-    print(f"🔑 Gemini Keys: {len(GEMINI_KEYS)} configured")
-    print(f"📚 Models: {', '.join([m['name'] for m in GEMINI_MODELS])}")
-    print("=" * 70)
-    print("📌 Send 'Start generating' via Telegram to begin")
-    print("📌 Send 'Status?' via Telegram to check progress")
-    print("=" * 70)
-    
-    # Start worker
-    worker = threading.Thread(target=background_worker_process, daemon=True)
-    worker.start()
-    print("✅ Worker thread started")
-    
-    # Start FastAPI
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+    print("=" * 60)
+    print("🚀 AI MCQ Generator System v3.0 Starting...")
+    print("=" * 60)
+    print(f"📊 MongoDB: {'Connected' if mongo_client else 'Failed'}")
+    print(f"🤖 Telegram: {'Configured' if TELEGRAM_BOT_TOKEN else 'Missing'}")
+    print(f"👁️  Gemini Vision: {'Configured' if vision_model else 'Missing'}")
+    print(f"📚 AI Providers: {sum(1 for t in TIERS if t['key'])} of {len(TIERS)} configured")
+    print("=" * 60)
+
+    try:
+        worker_thread = threading.Thread(target=background_worker_process, daemon=True)
+        worker_thread.start()
+        print("✅ Background Worker Thread Started")
+    except Exception as e:
+        print(f"❌ Worker thread error: {e}")
+
+    # Telegram runs in webhook mode via FastAPI's own event loop (see startup event above).
+
+    try:
+        port = int(os.environ.get("PORT", 8080))
+        print(f"✅ Starting FastAPI on port {port}...")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down gracefully...")
+    except Exception as e:
+        print(f"❌ FastAPI error: {e}")
+        traceback.print_exc()
