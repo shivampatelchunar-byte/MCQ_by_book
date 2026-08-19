@@ -5,7 +5,8 @@ services:
     plan: starter
     autoDeploy: true
     buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # The application includes its own background worker: keep exactly one Uvicorn worker.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -22,6 +23,12 @@ services:
         sync: false
       - key: GCP_SERVICE_ACCOUNT_JSON
         sync: false
+      # Preferred comma-separated credential/model configuration.
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GEMINI_OCR_MODELS
+        value: gemini-3.6-flash
+      # Legacy names are still accepted by main.py; remove them after migration if unused.
       - key: GEMINI_API_KEY_1
         sync: false
       - key: GEMINI_API_KEY_2
@@ -44,3 +51,7 @@ services:
         value: "120"
       - key: OCR_TIMEOUT_SECONDS
         value: "180"
+      - key: WORKER_LEASE_SECONDS
+        value: "300"
+      - key: MAX_PAGE_ATTEMPTS
+        value: "3"
