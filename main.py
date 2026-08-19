@@ -1,13 +1,7 @@
 """
-AI MCQ Generator System — v4.0 (Latest Free AI Models + Auto-Config)
-====================================================================
-
-FIXES:
-- All AI providers updated to latest FREE models
-- Auto-retry with exponential backoff
-- Better error handling and logging
-- Supports: Gemini, Groq, Cerebras, Mistral, SambaNova, OpenRouter
-- Automatic model fallback if one fails
+AI MCQ Generator System — v4.1 (Gemini 3.6 Flash)
+==================================================
+FIX: Gemini 2.5 Flash is deprecated → Updated to Gemini 3.6 Flash
 """
 
 import os
@@ -44,7 +38,7 @@ GEMINI_KEY_2 = os.getenv("GEMINI_API_KEY_2")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Retired, but kept for compatibility
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 CEREBRAS_KEY = os.getenv("CEREBRAS_API_KEY")
 SAMBANOVA_KEY = os.getenv("SAMBANOVA_API_KEY")
 
@@ -90,9 +84,10 @@ config_col.update_one(
 print("✅ Configuration ready!")
 
 # =====================================================================
-# 3. GEMINI SETUP (Vision OCR + Telegram Agent)
+# 3. GEMINI SETUP (Vision OCR + Telegram Agent) — UPDATED TO 3.6 FLASH
 # =====================================================================
-GEMINI_MODEL_NAME = "gemini-2.5-flash"  # Latest free Gemini model
+# 🔥 FIX: Gemini 2.5 Flash is deprecated → Using Gemini 3.6 Flash
+GEMINI_MODEL_NAME = "gemini-3.6-flash"
 vision_model = None
 agent_model = None
 
@@ -269,25 +264,19 @@ class MCQList(BaseModel):
     mcqs: list[SingleMCQ]
 
 # =====================================================================
-# 7. MULTI-TIER AI FALLBACK ENGINE — UPDATED WITH LATEST FREE MODELS
+# 7. MULTI-TIER AI FALLBACK ENGINE — UPDATED WITH GEMINI 3.6 FLASH
 # =====================================================================
 TIERS = [
-    # 1. Gemini 2.5 Flash (Best free model, high quality)
-    {"name": "Gemini 2.5 Flash", "type": "gemini", "model": "gemini-2.5-flash", "key": GEMINI_KEY_1},
-    # 2. Groq — fastest inference, good for simple MCQ generation
+    # 🔥 FIX: Gemini 2.5 Flash → Gemini 3.6 Flash
+    {"name": "Gemini 3.6 Flash", "type": "gemini", "model": "gemini-3.6-flash", "key": GEMINI_KEY_1},
     {"name": "Groq", "type": "openai", "base_url": "https://api.groq.com/openai/v1", "model": "llama3-70b-8192", "key": GROQ_KEY},
-    # 3. Cerebras — very fast, good quality
     {"name": "Cerebras", "type": "openai", "base_url": "https://api.cerebras.ai/v1", "model": "llama3.1-70b", "key": CEREBRAS_KEY},
-    # 4. Mistral — good for complex reasoning
     {"name": "Mistral", "type": "openai", "base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key": MISTRAL_KEY},
-    # 5. SambaNova — strong alternative
     {"name": "SambaNova", "type": "openai", "base_url": "https://api.sambanova.ai/v1", "model": "Meta-Llama-3.1-70B-Instruct", "key": SAMBANOVA_KEY},
-    # 6. OpenRouter — fallback with multiple free models
     {"name": "OpenRouter", "type": "openai", "base_url": "https://openrouter.ai/api/v1", "model": "google/gemini-2.5-flash:free", "key": OPENROUTER_KEY},
 ]
 
 def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
-    """Generates MCQs using multi-tier fallback with latest free AI models."""
     full_prompt = f"{custom_prompt}\n\nPAGE TEXT:\n{page_text}\n\nReturn output strictly matching the required JSON schema."
 
     for tier in TIERS:
@@ -298,7 +287,6 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
             print(f"🔄 Trying {tier['name']}...")
 
             if tier["type"] == "gemini":
-                # Gemini direct call
                 try:
                     genai.configure(api_key=tier["key"])
                     model = genai.GenerativeModel(tier["model"])
@@ -313,7 +301,6 @@ def generate_mcqs_with_fallback(page_text: str, custom_prompt: str) -> MCQList:
                     continue
 
             else:
-                # OpenAI-compatible providers
                 client = OpenAI(api_key=tier["key"], base_url=tier["base_url"])
                 response = client.chat.completions.create(
                     model=tier["model"],
@@ -404,7 +391,6 @@ def background_worker_process():
                         upsert=True
                     )
 
-                # Generate MCQs with fallback
                 mcq_data = generate_mcqs_with_fallback(page_text, config["system_prompt"])
 
                 gc = get_gspread_client()
@@ -690,7 +676,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print("=" * 60)
-    print("🚀 AI MCQ Generator System v4.0 Starting...")
+    print("🚀 AI MCQ Generator System v4.1 Starting...")
     print("=" * 60)
     print(f"📊 MongoDB: {'Connected' if mongo_client else 'Failed'}")
     print(f"🤖 Telegram: {'Configured' if TELEGRAM_BOT_TOKEN else 'Missing'}")
