@@ -131,7 +131,7 @@ except Exception as e:
     print(f"⚠️ Gemini config warning: {e}")
 
 
-def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: float = 5.0):
+def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: float = 5.0, generation_config: dict = None):
     """
     Calls model.generate_content() with exponential backoff.
     Rate-limit errors (429 / quota / RESOURCE_EXHAUSTED) get a longer backoff
@@ -140,6 +140,8 @@ def call_gemini_with_retry(model, contents, max_retries: int = 3, base_delay: fl
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
+            if generation_config:
+                return model.generate_content(contents, generation_config=generation_config)
             return model.generate_content(contents)
         except Exception as e:
             last_err = e
@@ -592,8 +594,20 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         response = call_gemini_with_retry(
             agent_model,
             f"{AGENT_PROMPT}\n\nUser Input: {user_text}",
+            generation_config={"response_mime_type": "application/json"},
         )
-        intent = json.loads(response.text)
+        raw_reply = (response.text or "").strip()
+        # Defensive: strip ```json ... ``` fences if the model adds them anyway
+        if raw_reply.startswith("```"):
+            raw_reply = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_reply.strip())
+
+        if not raw_reply:
+            await update.message.reply_text(
+                "❌ Agent Error: Gemini returned an empty response. Please try again."
+            )
+            return
+
+        intent = json.loads(raw_reply)
         action = intent.get("action")
         value = intent.get("extracted_value", "") or ""
         reply = intent.get("reply_message", "Action acknowledged.")
