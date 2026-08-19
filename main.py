@@ -82,6 +82,10 @@ OCR_TIMEOUT_SECONDS = int(env("OCR_TIMEOUT_SECONDS", default="180"))
 LEASE_SECONDS = int(env("WORKER_LEASE_SECONDS", default="300"))
 MAX_PAGE_ATTEMPTS = int(env("MAX_PAGE_ATTEMPTS", default="3"))
 MAX_RENDER_PIXELS = int(env("MAX_RENDER_PIXELS", default="18000000"))
+# A daily free-tier exhaustion cannot realistically be solved by a 20-30 second
+# retry delay included in some provider responses. Avoid repeatedly consuming
+# failed calls; this is configurable from Render if a shorter wait is desired.
+DAILY_QUOTA_COOLDOWN_SECONDS = int(env("DAILY_QUOTA_COOLDOWN_SECONDS", default="21600"))
 WEBHOOK_PATH = "/telegram-webhook"
 RESERVED_ROWS_PER_PAGE = 10
 WORKER_ID = f"{os.getenv('RENDER_INSTANCE_ID', 'worker')}:{uuid.uuid4().hex[:12]}"
@@ -202,7 +206,13 @@ class QuotaExhausted(RuntimeError):
 
 
 def retry_seconds_from_error(exc: Exception, default: int = 300) -> int:
-    match = re.search(r"retry(?:_delay| in)?[^0-9]{0,30}(\d+)", str(exc), re.I)
+    message = str(exc)
+    normalized = message.lower().replace("_", "")
+    # Gemini can return a short retry_delay together with a per-day quota ID.
+    # The quota ID is authoritative: short retries only create log/API churn.
+    if "requestsperday" in normalized or "perday" in normalized or "daily quota" in normalized:
+        return DAILY_QUOTA_COOLDOWN_SECONDS
+    match = re.search(r"retry(?:_delay| in)?[^0-9]{0,30}(\d+)", message, re.I)
     return int(match.group(1)) if match else default
 
 
@@ -469,6 +479,10 @@ async def worker_loop() -> None:
         try:
             await asyncio.to_thread(process_page, config)
             await asyncio.to_thread(configs.update_one, {"_id": config["_id"], "run_id": config["run_id"], "lease_owner": WORKER_ID}, {"$set": {"lease_until": now(), "failure_count": 0}})
+        except QuotaExhausted as exc:
+            # Quota is an expected provider state, not an application crash.
+            log.warning("OCR quota cooldown for %s; next attempt in %ss", config["_id"], exc.retry_seconds)
+            await asyncio.to_thread(retry_later, config, exc)
         except Exception as exc:
             log.exception("Job failed for %s: %s", config["_id"], exc)
             await asyncio.to_thread(retry_later, config, exc)
