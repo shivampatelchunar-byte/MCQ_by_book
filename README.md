@@ -8,4 +8,4 @@ Required configuration: `MONGO_URI`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USE
 
 Provider selection is automatic: only keys present in Render are enabled. Defaults can be overridden with `CEREBRAS_MODEL`, `GROQ_MODEL`, `MISTRAL_MODEL`, `SAMBANOVA_MODEL`, or `OPENROUTER_MODEL`.
 
-Telegram commands: `/set_pdf <Google Drive URL>`, `/set_sheet <Google Sheets URL>`, `/start`, `/pause`, `/reset <PDF page>`, `/status`, and `/clear_and_restart CONFIRM <last PDF page>`. The last command permanently clears the first Sheet tab, resets its jobs, starts at PDF page 1, and pauses after the supplied last page.
+Telegram commands: `/set_pdf <Google Drive URL>`, `/set_sheet <Google Sheets URL>`, `/start`, `/pause`, `/reset <PDF page>`, `/status`, and `/clear_and_restart CONFIRM ALL`. The last command permanently clears the first Sheet tab, resets its jobs, and processes the whole PDF from page 1.

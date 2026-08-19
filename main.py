@@ -337,7 +337,7 @@ def claim_config() -> dict[str, Any] | None:
     return configs.find_one_and_update({"status": "running", "$or": [{"lease_until": {"$exists": False}}, {"lease_until": {"$lte": at}}]}, {"$set": {"lease_until": at + timedelta(seconds=LEASE_SECONDS)}}, return_document=ReturnDocument.AFTER)
 
 
-def clear_sheet_and_restart(chat_id: int, stop_after: int) -> None:
+def clear_sheet_and_restart(chat_id: int, stop_after: int | None) -> None:
     config = get_config(chat_id)
     if not config["sheet_url"]:
         raise RuntimeError("Set the Google Sheet first with /set_sheet")
@@ -418,17 +418,19 @@ async def command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await asyncio.to_thread(configs.update_one, {"_id": config_id(chat)}, {"$set": {"current_pdf_page": target, "status": "paused", "updated_at": now()}})
         await update.effective_message.reply_text("Cursor reset. Existing page jobs overwrite their reserved rows, so no duplicate rows are appended.")
-    elif re.fullmatch(r"/clear_and_restart\s+CONFIRM\s+\d+", message):
-        stop_after = int(message.split()[2])
-        if stop_after < 1:
+    elif re.fullmatch(r"/clear_and_restart\s+CONFIRM\s+(?:ALL|\d+)", message):
+        value = message.split()[2]
+        stop_after = None if value == "ALL" else int(value)
+        if stop_after is not None and stop_after < 1:
             return await update.effective_message.reply_text("Last page must be 1 or greater.")
         try:
             await asyncio.to_thread(clear_sheet_and_restart, chat, stop_after)
-            await update.effective_message.reply_text(f"Sheet cleared. Processing starts at PDF page 1 and pauses after page {stop_after}.")
+            end_message = "continues until the last PDF page" if stop_after is None else f"pauses after page {stop_after}"
+            await update.effective_message.reply_text(f"Sheet cleared. Processing starts at PDF page 1 and {end_message}.")
         except Exception as exc:
             await update.effective_message.reply_text(f"Could not clear/restart: {type(exc).__name__}: {exc}")
     else:
-        await update.effective_message.reply_text("Commands: /set_pdf URL, /set_sheet URL, /start, /pause, /reset N, /status, /clear_and_restart CONFIRM LAST_PAGE")
+        await update.effective_message.reply_text("Commands: /set_pdf URL, /set_sheet URL, /start, /pause, /reset N, /status, /clear_and_restart CONFIRM ALL")
 
 
 telegram_app.add_handler(CommandHandler("status", show_status))

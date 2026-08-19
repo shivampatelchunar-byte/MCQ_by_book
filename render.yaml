@@ -40,3 +40,7 @@ services:
         sync: false
       - key: MAX_PDF_MB
         value: "80"
+      - key: OCR_DPI
+        value: "120"
+      - key: OCR_TIMEOUT_SECONDS
+        value: "180"
