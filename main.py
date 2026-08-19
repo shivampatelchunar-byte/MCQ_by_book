@@ -130,7 +130,20 @@ def migrate_legacy_configs() -> None:
         )
 
 
-def normalize_service_account_json(raw: str) -> dict[str, Any]:
+def migrate_legacy_job_index() -> None:
+    """Remove the old unique (config_id, pdf_page) index from the pre-run_id schema.
+
+    The old index prevents a fresh run of the same PDF page from creating its
+    new run-specific job. That collision previously made reserve_job return
+    None and caused the TypeError seen in Render logs.
+    """
+    for name, details in jobs.index_information().items():
+        if details.get("key") == [("config_id", 1), ("pdf_page", 1)] and details.get("unique"):
+            jobs.drop_index(name)
+            log.info("Removed legacy unique page-job index: %s", name)
+
+
+def normalize_service_account_json(raw: str) -> dict[str, Any]: 
     raw = raw.strip()
     if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
         raw = raw[1:-1]
@@ -393,7 +406,11 @@ def reserve_job(config: dict[str, Any], pdf_page: int) -> dict[str, Any]:
         jobs.insert_one(document)
         return document
     except DuplicateKeyError:
-        return jobs.find_one({"_id": job_id})
+        # A second worker may have inserted the same run-specific job first.
+        existing = jobs.find_one({"_id": job_id})
+        if existing:
+            return existing
+        raise RuntimeError("Page-job reservation collided; retry after legacy-index migration")
 
 
 def process_page(config: dict[str, Any]) -> None:
@@ -565,6 +582,7 @@ telegram_app.add_handler(CommandHandler("help", help_command))
 async def lifespan(_: FastAPI):
     mongo.admin.command("ping")
     migrate_legacy_configs()
+    migrate_legacy_job_index()
     configs.create_index([("status", ASCENDING), ("next_retry_at", ASCENDING), ("lease_until", ASCENDING)])
     jobs.create_index([("config_id", ASCENDING), ("run_id", ASCENDING), ("pdf_page", ASCENDING)])
     updates.create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
