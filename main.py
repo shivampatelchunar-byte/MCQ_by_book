@@ -37,7 +37,7 @@ from openai import OpenAI
 from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
     import google.generativeai as genai
@@ -111,9 +111,12 @@ GEMINI_KEYS = csv_values(env("GEMINI_API_KEYS")) or csv_values(
     ",".join(filter(None, [env("GEMINI_API_KEY_1"), env("GEMINI_API_KEY_2")]))
 )
 
-# Strongly recommended for scanned PDFs: set ONLY your actually active Gemini OCR models.
-# Example: GEMINI_OCR_MODELS=gemini-1.5-flash,gemini-1.5-pro,<third_active_model>
-GEMINI_OCR_MODELS_FORCED = csv_values(env("GEMINI_OCR_MODELS", default=""))
+# GEMINI_OCR_MODELS is authoritative. Legacy GEMINI_MODEL remains supported.
+# Do not fall back to guessed/retired model IDs: that creates avoidable NotFound calls.
+GEMINI_OCR_MODELS_FORCED = (
+    csv_values(env("GEMINI_OCR_MODELS"))
+    or csv_values(env("GEMINI_MODEL", default="gemini-3.6-flash"))
+)
 
 # OCR + Worker tuning
 MAX_PDF_MB = int(env("MAX_PDF_MB", default="120"))  # scanned PDFs can be large
@@ -554,6 +557,24 @@ def page_source(document: fitz.Document, page_index: int) -> tuple[str, list[int
     return (native + "\n\n" + visual).strip(), numbers
 
 
+# Pages such as foreword/preface/contents are front matter, not question source.
+# This is intentionally conservative: an actual chapter called "Introduction" is not skipped.
+FRONT_MATTER_RE = re.compile(
+    r"\b(table\s+of\s+contents|contents|foreword|acknowledg(?:e)?ments?|dedication|preface|"
+    r"copyright|all\s+rights\s+reserved|about\s+the\s+author|isbn)\b", re.I
+)
+
+
+def is_front_matter(text: str) -> tuple[bool, str]:
+    sample = re.sub(r"\s+", " ", text[:1800]).strip()
+    match = FRONT_MATTER_RE.search(sample)
+    # A heading near the start is strong evidence. Do not discard a normal chapter
+    # merely because it cites one of these words later in its body.
+    if match and match.start() < 350:
+        return True, match.group(1).title()
+    return False, ""
+
+
 # ---------------------------
 # MCQ Providers
 # ---------------------------
@@ -899,6 +920,19 @@ def process_page(config: dict[str, Any]) -> None:
             return
         raise RuntimeError("OCR returned too little text")
 
+    front_matter, section = is_front_matter(text)
+    if front_matter:
+        jobs.update_one(
+            {"_id": job["_id"]},
+            {"$set": {"status": "skipped", "reason": f"front_matter:{section}", "completed_at": now()}},
+        )
+        configs.update_one(
+            {"_id": config["_id"], "run_id": config["run_id"], "current_pdf_page": pdf_page},
+            {"$inc": {"current_pdf_page": 1}, "$set": {"last_page_label": f"Skipped {section}", "updated_at": now()}},
+        )
+        log.info("Skipped front-matter PDF page %s: %s", pdf_page, section)
+        return
+
     display_page = min(page_numbers) if page_numbers else pdf_page
     label = "-".join(map(str, (min(page_numbers), max(page_numbers)))) if len(page_numbers) > 1 else str(display_page)
 
@@ -1198,6 +1232,81 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
+
+
+def agent_status_text(c: dict[str, Any]) -> str:
+    retry = utc_datetime(c.get("next_retry_at"))
+    retry_text = retry.isoformat() if retry and retry > now() else "abhi retry allowed hai"
+    return (
+        f"Status: {c['status']}\n"
+        f"PDF page: {c['current_pdf_page']}\n"
+        f"Last page: {c.get('last_page_label') or '—'}\n"
+        f"MCQs: {c['total_questions']}\n"
+        f"PDF: {'set' if c['pdf_url'] else 'missing'} | Sheet: {'set' if c['sheet_url'] else 'missing'}\n"
+        f"Retry: {retry_text}"
+    )
+
+
+async def agent_message(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Natural-language control for the owner; slash commands remain available."""
+    if not await require_user(update):
+        return
+    text = (update.effective_message.text or "").strip()
+    lowered = text.casefold()
+    chat = update.effective_chat.id
+    urls = [u.rstrip(".,)") for u in URL_RE.findall(text)]
+    pdf_url = next((u for u in urls if "drive.google.com" in u), None)
+    sheet_url = next((u for u in urls if "docs.google.com/spreadsheets" in u), None)
+
+    # Natural message may contain both links: save them atomically as one clean run.
+    if pdf_url or sheet_url:
+        try:
+            if pdf_url:
+                drive_file_id(pdf_url)
+            if sheet_url:
+                validate_sheet_url(sheet_url)
+        except ValueError as exc:
+            await update.effective_message.reply_text(str(exc))
+            return
+        c = await asyncio.to_thread(get_config, chat)
+        changes: dict[str, Any] = {"run_id": uuid.uuid4().hex, "status": "paused", "current_pdf_page": 1,
+                                   "next_sheet_row": 2, "total_questions": 0, "last_page_label": "",
+                                   "next_retry_at": now(), "updated_at": now()}
+        if pdf_url:
+            changes["pdf_url"] = pdf_url
+        if sheet_url:
+            changes["sheet_url"] = sheet_url
+        await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": changes})
+        missing = []
+        if not (pdf_url or c.get("pdf_url")):
+            missing.append("PDF")
+        if not (sheet_url or c.get("sheet_url")):
+            missing.append("Google Sheet")
+        if missing:
+            await update.effective_message.reply_text("Link saved. Ab " + " aur ".join(missing) + " link bhejiye, phir bolo 'start karo'.")
+        else:
+            await update.effective_message.reply_text("Naya PDF/Sheet run save ho gaya. Sheet ko service account ke saath Editor share karke 'start karo' boliye.")
+        return
+
+    c = await asyncio.to_thread(get_config, chat)
+    if any(word in lowered for word in ("status", "kaisa kam", "kaam kaisa", "progress", "kitne question", "kitne mcq")):
+        await update.effective_message.reply_text(agent_status_text(c))
+        return
+    if any(word in lowered for word in ("pause", "rok do", "stop karo", "band karo")):
+        await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": {"status": "paused", "updated_at": now()}})
+        await update.effective_message.reply_text("Processing pause kar diya hai.")
+        return
+    if any(word in lowered for word in ("start", "resume", "chalu", "shuru")):
+        if not c.get("pdf_url") or not c.get("sheet_url"):
+            await update.effective_message.reply_text("Pehle Drive PDF aur Google Sheet links bhejiye.")
+            return
+        await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": {"status": "running", "next_retry_at": now(), "updated_at": now()}})
+        await update.effective_message.reply_text("Worker start ho gaya. Main front matter jaise Contents, Foreword, Acknowledgement, Dedication aur Preface ko skip karunga.")
+        return
+    await update.effective_message.reply_text("Main aapka book-to-MCQ assistant hoon. Drive PDF aur Google Sheet links bhejiye, ya bolo 'status batao', 'start karo', ya 'pause karo'.")
+
+
 telegram_app.add_handler(CommandHandler("set_pdf", set_pdf))
 telegram_app.add_handler(CommandHandler("set_sheet", set_sheet))
 telegram_app.add_handler(CommandHandler(["start", "resume"], start_resume))
@@ -1206,6 +1315,7 @@ telegram_app.add_handler(CommandHandler("reset", reset))
 telegram_app.add_handler(CommandHandler("status", status))
 telegram_app.add_handler(CommandHandler("clear_and_restart", clear_and_restart))
 telegram_app.add_handler(CommandHandler("help", help_command))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, agent_message))
 
 
 # ---------------------------
