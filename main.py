@@ -150,6 +150,8 @@ MCQS_PER_PAGE = int(env("MCQS_PER_PAGE", default="5"))
 if MCQS_PER_PAGE < 4 or MCQS_PER_PAGE > 8:
     raise RuntimeError("MCQS_PER_PAGE must be between 4 and 8")
 RESERVED_ROWS_PER_PAGE = MCQS_PER_PAGE
+# Reject years/citation numbers that OCR mistakes for a footer page label.
+MAX_REASONABLE_BOOK_PAGE = int(env("MAX_REASONABLE_BOOK_PAGE", default="1000"))
 WORKER_ID = f"{os.getenv('RENDER_INSTANCE_ID', 'worker')}:{uuid.uuid4().hex[:12]}"
 
 # Provider model list cache
@@ -198,6 +200,7 @@ def empty_book_profile() -> dict[str, Any]:
         "source": "unset",
         "content_started": False,
         "content_start_pdf_page": None,
+        "content_start_book_page": None,
     }
 
 
@@ -206,6 +209,7 @@ def reset_profile_progress(profile: dict[str, Any] | None) -> dict[str, Any]:
     result = dict(profile or empty_book_profile())
     result["content_started"] = False
     result["content_start_pdf_page"] = None
+    result["content_start_book_page"] = None
     return result
 
 
@@ -932,6 +936,32 @@ HEADERS = [
 ]
 
 
+def resolve_book_page(config: dict[str, Any], pdf_page: int, candidates: list[int]) -> tuple[int | None, str]:
+    """Prefer a plausible header/footer number; otherwise use TOC-calibrated sequence.
+
+    OCR often mistakes citation years (e.g. 1927, 1945) for footer labels. The
+    first TOC chapter gives a reliable calibration point: printed page 1 at the
+    detected physical chapter-start PDF page. Values far from this progression
+    are discarded instead of corrupting Topic and Book Page.
+    """
+    profile = config.get("book_profile") or {}
+    start_pdf = profile.get("content_start_pdf_page")
+    start_book = profile.get("content_start_book_page")
+    expected = None
+    if isinstance(start_pdf, int) and isinstance(start_book, int):
+        expected = start_book + (pdf_page - start_pdf)
+    clean = sorted({n for n in candidates if 1 <= int(n) <= MAX_REASONABLE_BOOK_PAGE})
+    if expected is not None:
+        near = [n for n in clean if abs(n - expected) <= 3]
+        if near:
+            return min(near, key=lambda n: abs(n - expected)), "header_footer"
+        # The sequence is derived from the TOC chapter start, not from a PDF index.
+        return expected, "toc_sequence"
+    if clean:
+        return clean[0], "header_footer"
+    return None, "unreadable"
+
+
 def topic_for(config: dict[str, Any], printed_page: int | None) -> str:
     """Resolve only from the active book profile; never leak old-book ranges."""
     if printed_page is None:
@@ -1109,17 +1139,18 @@ def process_page(config: dict[str, Any]) -> None:
             return
         profile["content_started"] = True
         profile["content_start_pdf_page"] = pdf_page
+        profile["content_start_book_page"] = int(ranges[0].get("from", 1))
         configs.update_one(
             {"_id": config["_id"], "run_id": config["run_id"]},
             {"$set": {"book_profile": profile, "updated_at": now()}},
         )
         log.info("First TOC chapter detected at PDF page %s: %s", pdf_page, ranges[0].get("topic"))
 
-    # Never substitute the PDF physical index for a book header/footer number.
-    # Incorrect metadata is worse than an explicit unreadable marker.
-    display_page: int | None = min(page_numbers) if page_numbers else None
-    label = ("-".join(map(str, (min(page_numbers), max(page_numbers)))) if len(page_numbers) > 1
-             else str(display_page) if display_page is not None else "Unreadable printed page")
+    # Use only plausible footer/header labels. If OCR captured citation years,
+    # use the validated TOC-calibrated book sequence rather than a PDF index.
+    display_page, page_source = resolve_book_page(config, pdf_page, page_numbers)
+    label = str(display_page) if display_page is not None else "Unreadable printed page"
+    log.info("Book page resolved for PDF page %s: %s (%s)", pdf_page, label, page_source)
 
     mcqs = generate_mcqs(text)
     job = reserve_output_range(config, job)
@@ -1458,7 +1489,7 @@ def parse_toc_profile(text: str) -> dict[str, Any] | None:
         ranges.append({"topic": topic, "from": start, "to": end})
     return {"title": "", "topic_ranges": ranges, "skip_sections": DEFAULT_SKIP_SECTIONS,
             "configured_at": now(), "source": "telegram_toc", "content_started": False,
-            "content_start_pdf_page": None} if ranges else None
+            "content_start_pdf_page": None, "content_start_book_page": None} if ranges else None
 
 
 

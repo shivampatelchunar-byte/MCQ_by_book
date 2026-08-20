@@ -2,26 +2,20 @@
 
 ## Contiguous Sheet rows
 
-`MCQS_PER_PAGE=5` forces exactly five MCQs for each valid content page. The worker now creates a logical page job first, but reserves five Sheet rows **only after** OCR/classification succeeds and five MCQs are ready. Skipped Contents/Foreword/Preface pages consume zero Sheet rows. This removes both kinds of gaps: variable-count gaps and skipped-page gaps.
+`MCQS_PER_PAGE=5` forces five MCQs for every valid source page. A page job is created before OCR, but five Google Sheet rows are allocated only after classification and MCQ generation succeeds. Skipped Contents/Foreword/Preface pages allocate no rows, so there are no blank page blocks.
 
-After deployment, use `/clear_and_restart CONFIRM ALL` once. It clears older output and starts a clean run with the active PDF, Sheet, and TOC profile preserved.
+## Printed Book Page validation
 
-## Book Page semantics
+The app extracts header/footer candidates with full-page OCR plus a narrow footer/header band pass. It rejects implausible values above `MAX_REASONABLE_BOOK_PAGE` (default 1000), which prevents citation years such as `1927`, `1933`, and `1945` from being stored as Book Page numbers.
 
-The `Book Page` column comes only from a printed header/footer label. OCR first reads the page, then performs a narrow footer/header-band Tesseract pass if the full page omitted the label. It never writes a physical PDF index as a Book Page. If a label is still unreadable, the Sheet explicitly says `Unreadable printed page`; no incorrect topic mapping is guessed.
+At the first TOC chapter heading, the app records both the physical PDF start page and the configured printed TOC start page. Later pages accept a header/footer label only when it agrees with the calibrated TOC progression. Otherwise the Book Page is the TOC-calibrated sequence, never a raw PDF page index and never an OCR citation year.
 
-## TOC start guard
-
-The worker skips introductory pages until the first TOC topic/chapter heading is detected. Clean restart resets this state, so the first real chapter is rediscovered every run.
-
-## Explicit MCQ model order
-
-No arbitrary model discovery is used for question generation. Models from `render.yaml` are tried in this safe order: Groq, Mistral, SambaNova, OpenRouter, Cerebras. This avoids Prompt Guard and Safeguard moderation models.
-
-## Deploy / restart
+## Clean restart
 
 1. `pause karo`
-2. Deploy this release to the Docker service only.
-3. Confirm the old service is stopped.
+2. Deploy this Docker release only.
+3. Ensure old services are stopped.
 4. `/clear_and_restart CONFIRM ALL`
 5. `status batao`
+
+The current PDF, Sheet and TOC profile stay saved. A clean restart resets chapter detection so the first real TOC chapter is located again.

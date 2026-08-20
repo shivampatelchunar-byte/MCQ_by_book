@@ -72,7 +72,7 @@ services:
         value: "5"
       # Explicit chat models avoid prompt-guard / safeguard model errors.
       - key: GROQ_MODELS
-        value: openai/gpt-oss-20b
+        value: openai/gpt-oss-120b,openai/gpt-oss-20b
       - key: MISTRAL_MODELS
         value: mistral-medium-2508,mistral-medium-2505
       - key: SAMBANOVA_MODELS
@@ -81,3 +81,5 @@ services:
         value: qwen/qwen3.8-27b
       - key: CEREBRAS_MODELS
         value: gpt-oss-120b
+      - key: MAX_REASONABLE_BOOK_PAGE
+        value: "1000"
