@@ -1313,19 +1313,21 @@ async def agent_message(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     lowered = text.casefold()
     chat = update.effective_chat.id
 
-    # A user can paste a TOC in normal language; it is saved per current PDF.
-    if any(token in lowered for token in ("table of contents", "contents profile", "toc profile", "chapter page mapping", "toc set")):
-        profile = parse_toc_profile(text)
-        if not profile:
-            await update.effective_message.reply_text(
-                "TOC save nahi hua. Har line is format mein bhejiye: Plant Breeding: 1 to 61\nPlant Genetics: 62 to 93"
-            )
-            return
+    # A pasted chapter mapping is recognised even if the user does not write "TOC profile".
+    # This makes normal Telegram text a first-class agent input, not a hidden command.
+    profile = parse_toc_profile(text)
+    toc_intent = any(token in lowered for token in ("table of contents", "contents profile", "toc profile", "chapter page mapping", "toc set", "toc"))
+    if profile:
         c = await asyncio.to_thread(get_config, chat)
         await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": {"book_profile": profile, "updated_at": now()}})
         first = profile["topic_ranges"][0]
         await update.effective_message.reply_text(
             f"TOC profile saved: {len(profile['topic_ranges'])} topics. MCQs start only after front matter; first configured topic is {first['topic']} (printed page {first['from']})."
+        )
+        return
+    if toc_intent:
+        await update.effective_message.reply_text(
+            "TOC save nahi hua. Text mein har chapter alag line mein bhejiye: Plant Breeding: 1 to 61\nPlant Genetics: 62 to 93"
         )
         return
 
