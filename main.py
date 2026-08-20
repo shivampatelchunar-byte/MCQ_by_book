@@ -1148,9 +1148,9 @@ def process_page(config: dict[str, Any]) -> None:
 
     # Use only plausible footer/header labels. If OCR captured citation years,
     # use the validated TOC-calibrated book sequence rather than a PDF index.
-    display_page, page_source = resolve_book_page(config, pdf_page, page_numbers)
+    display_page, page_number_origin = resolve_book_page(config, pdf_page, page_numbers)
     label = str(display_page) if display_page is not None else "Unreadable printed page"
-    log.info("Book page resolved for PDF page %s: %s (%s)", pdf_page, label, page_source)
+    log.info("Book page resolved for PDF page %s: %s (%s)", pdf_page, label, page_number_origin)
 
     mcqs = generate_mcqs(text)
     job = reserve_output_range(config, job)
