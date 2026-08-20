@@ -610,6 +610,25 @@ def printed_page_numbers(text: str) -> list[int]:
     return sorted(numbers)
 
 
+def footer_page_numbers(page: fitz.Page) -> list[int]:
+    """Second-pass OCR restricted to footer/header bands for reliable printed page metadata."""
+    if not LOCAL_OCR_ENABLED:
+        return []
+    rect = page.rect
+    # Most textbooks place the printed book number in a narrow footer. Inspect
+    # the header as a fallback, but never inspect the body where figures/numbers live.
+    clips = [fitz.Rect(rect.x0, rect.y0 + rect.height * 0.78, rect.x1, rect.y1),
+             fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.16)]
+    values: set[int] = set()
+    for clip in clips:
+        try:
+            image = page.get_pixmap(clip=clip, dpi=max(OCR_DPI, 144), alpha=False).tobytes("png")
+            values.update(printed_page_numbers(tesseract_ocr(image)))
+        except Exception:
+            continue
+    return sorted(values)
+
+
 def tesseract_ocr(image: bytes) -> str:
     """Offline OCR. The Docker image supplies the tesseract binary and language pack."""
     try:
@@ -711,8 +730,12 @@ def page_source(document: fitz.Document, page_index: int) -> tuple[str, list[int
     page = document.load_page(page_index)
     native = extract_native_text(page)
     if len(native) >= 250:
-        return native, printed_page_numbers(native)
+        numbers = printed_page_numbers(native) or footer_page_numbers(page)
+        return native, numbers
     text, numbers, provider = ocr_with_fallbacks(render_page_png(page))
+    # Whole-page OCR can omit a tiny footer. Perform a cheap band-only pass so
+    # Book Page is sourced from the printed header/footer, never the PDF index.
+    numbers = numbers or footer_page_numbers(page)
     log.info("OCR succeeded via %s for PDF page %s", provider, page_index + 1)
     return (native + "\n\n" + text).strip(), numbers
 
@@ -967,30 +990,19 @@ def write_page(config: dict[str, Any], job: dict[str, Any], mcqs: list[dict[str,
 # Jobs / Worker
 # ---------------------------
 def reserve_job(config: dict[str, Any], pdf_page: int) -> dict[str, Any]:
+    """Create a logical job only. Sheet rows are allocated after valid MCQs exist.
+
+    Skipped Contents/Foreword pages must consume zero Sheet rows; reserving rows
+    here was the root cause of visible blank gaps.
+    """
     job_id = f"{config['_id']}:{config['run_id']}:{pdf_page}"
     existing = jobs.find_one({"_id": job_id})
     if existing:
         return existing
-
-    reserved = configs.find_one_and_update(
-        {"_id": config["_id"], "run_id": config["run_id"], "current_pdf_page": pdf_page},
-        {"$inc": {"next_sheet_row": RESERVED_ROWS_PER_PAGE}, "$set": {"updated_at": now()}},
-        return_document=ReturnDocument.BEFORE,
-    )
-    if not reserved:
-        raise RuntimeError("Config changed before job reservation")
-
     document = {
-        "_id": job_id,
-        "config_id": config["_id"],
-        "run_id": config["run_id"],
-        "pdf_page": pdf_page,
-        "status": "processing",
-        "sheet_start_row": reserved["next_sheet_row"],
-        "attempts": 0,
-        "created_at": now(),
+        "_id": job_id, "config_id": config["_id"], "run_id": config["run_id"],
+        "pdf_page": pdf_page, "status": "processing", "attempts": 0, "created_at": now(),
     }
-
     try:
         jobs.insert_one(document)
         return document
@@ -998,7 +1010,33 @@ def reserve_job(config: dict[str, Any], pdf_page: int) -> dict[str, Any]:
         existing = jobs.find_one({"_id": job_id})
         if existing:
             return existing
-        raise
+        raise RuntimeError("Could not reserve page job")
+
+
+def reserve_output_range(config: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    """Allocate exactly MCQS_PER_PAGE rows only for a page that will be written."""
+    if job.get("sheet_start_row"):
+        return job
+    reserved = configs.find_one_and_update(
+        {"_id": config["_id"], "run_id": config["run_id"]},
+        {"$inc": {"next_sheet_row": RESERVED_ROWS_PER_PAGE}, "$set": {"updated_at": now()}},
+        return_document=ReturnDocument.BEFORE,
+    )
+    if not reserved:
+        raise RuntimeError("Config changed before output range reservation")
+    start = int(reserved["next_sheet_row"])
+    result = jobs.find_one_and_update(
+        {"_id": job["_id"], "sheet_start_row": {"$exists": False}},
+        {"$set": {"sheet_start_row": start, "reserved_question_count": MCQS_PER_PAGE}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if result:
+        return result
+    # A concurrent worker reserved the job first. Its stable range is authoritative.
+    existing = jobs.find_one({"_id": job["_id"]})
+    if existing and existing.get("sheet_start_row"):
+        return existing
+    raise RuntimeError("Output range reservation failed")
 
 
 def process_page(config: dict[str, Any]) -> None:
@@ -1084,6 +1122,7 @@ def process_page(config: dict[str, Any]) -> None:
              else str(display_page) if display_page is not None else "Unreadable printed page")
 
     mcqs = generate_mcqs(text)
+    job = reserve_output_range(config, job)
     write_page(config, job, mcqs, label, display_page)
 
     old_count = int(job.get("question_count", 0))
