@@ -164,6 +164,23 @@ telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
 # ---------------------------
 # Configuration documents
 # ---------------------------
+DEFAULT_SKIP_SECTIONS = [
+    "contents", "table of contents", "foreword", "acknowledgement", "acknowledgment",
+    "dedication", "preface", "copyright", "index", "references", "bibliography",
+    "appendix", "answer key", "glossary",
+]
+
+
+def empty_book_profile() -> dict[str, Any]:
+    return {
+        "title": "",
+        "topic_ranges": [],
+        "skip_sections": DEFAULT_SKIP_SECTIONS,
+        "configured_at": None,
+        "source": "unset",
+    }
+
+
 def config_id(chat_id: int) -> str:
     return f"chat:{chat_id}"
 
@@ -180,6 +197,7 @@ def default_config(chat_id: int) -> dict[str, Any]:
         "next_sheet_row": 2,
         "total_questions": 0,
         "last_page_label": "",
+        "book_profile": empty_book_profile(),
         "updated_at": now(),
     }
 
@@ -544,13 +562,20 @@ def gemini_vision_ocr(image: bytes) -> tuple[str, list[int]]:
     raise RuntimeError("Gemini OCR failed with every available credential/model") from last_error
 
 
+def native_printed_page_numbers(text: str) -> list[int]:
+    """Read isolated decimal header/footer page labels from a text PDF."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    candidates = lines[:6] + lines[-6:]
+    return sorted({int(line) for line in candidates if re.fullmatch(r"\d{1,4}", line)})
+
+
 def page_source(document: fitz.Document, page_index: int) -> tuple[str, list[int]]:
     page = document.load_page(page_index)
     native = extract_native_text(page)
 
-    # For scanned PDFs, native often empty; OCR will run.
+    # For digital PDFs, preserve a printed footer/header page number for TOC mapping.
     if len(native) >= 250:
-        return native, []
+        return native, native_printed_page_numbers(native)
 
     image = render_page_png(page)
     visual, numbers = gemini_vision_ocr(image)
@@ -559,19 +584,15 @@ def page_source(document: fitz.Document, page_index: int) -> tuple[str, list[int
 
 # Pages such as foreword/preface/contents are front matter, not question source.
 # This is intentionally conservative: an actual chapter called "Introduction" is not skipped.
-FRONT_MATTER_RE = re.compile(
-    r"\b(table\s+of\s+contents|contents|foreword|acknowledg(?:e)?ments?|dedication|preface|"
-    r"copyright|all\s+rights\s+reserved|about\s+the\s+author|isbn)\b", re.I
-)
-
-
-def is_front_matter(text: str) -> tuple[bool, str]:
+def is_front_matter(text: str, skip_sections: list[str] | None = None) -> tuple[bool, str]:
+    """Skip only when a configured front-matter heading is near page start."""
     sample = re.sub(r"\s+", " ", text[:1800]).strip()
-    match = FRONT_MATTER_RE.search(sample)
-    # A heading near the start is strong evidence. Do not discard a normal chapter
-    # merely because it cites one of these words later in its body.
-    if match and match.start() < 350:
-        return True, match.group(1).title()
+    sections = skip_sections or DEFAULT_SKIP_SECTIONS
+    for section in sections:
+        pattern = re.escape(section).replace(r"\ ", r"\s+")
+        match = re.search(r"\b" + pattern + r"\b", sample, re.I)
+        if match and match.start() < 350:
+            return True, section.title()
     return False, ""
 
 
@@ -790,19 +811,14 @@ HEADERS = [
 ]
 
 
-def topic_for(page: int) -> str:
-    ranges = [
-        (1, 27, "General Agriculture"),
-        (28, 214, "Agronomy"),
-        (215, 318, "Soil Science"),
-        (319, 338, "Agrometeorology"),
-        (339, 407, "Animal Husbandry and Dairy Science"),
-        (408, 466, "Agricultural Extension"),
-        (467, 540, "Agricultural Economics"),
-        (541, 571, "Agricultural Statistics"),
-    ]
-    return next((name for low, high, name in ranges if low <= page <= high), "Unclassified")
-
+def topic_for(config: dict[str, Any], printed_page: int) -> str:
+    """Resolve only from the active book profile; never leak old-book ranges."""
+    profile = config.get("book_profile") or {}
+    for item in profile.get("topic_ranges", []):
+        low, high = int(item["from"]), item.get("to")
+        if printed_page >= low and (high is None or printed_page <= int(high)):
+            return str(item["topic"])
+    return "Unclassified (TOC profile not set)"
 
 def write_page(config: dict[str, Any], job: dict[str, Any], mcqs: list[dict[str, str]], label: str, page: int) -> None:
     # Prevent writes from obsolete runs
@@ -825,7 +841,7 @@ def write_page(config: dict[str, Any], job: dict[str, Any], mcqs: list[dict[str,
         rows.append([
             start - 1 + i,
             label,
-            topic_for(page),
+            topic_for(config, page),
             x["question"],
             x["option_a"],
             x["option_b"],
@@ -920,7 +936,7 @@ def process_page(config: dict[str, Any]) -> None:
             return
         raise RuntimeError("OCR returned too little text")
 
-    front_matter, section = is_front_matter(text)
+    front_matter, section = is_front_matter(text, (config.get("book_profile") or {}).get("skip_sections"))
     if front_matter:
         jobs.update_one(
             {"_id": job["_id"]},
@@ -1056,12 +1072,13 @@ async def set_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "next_sheet_row": 2,
                 "total_questions": 0,
                 "last_page_label": "",
+                "book_profile": empty_book_profile(),  # New PDF must never inherit old book TOC.
                 "next_retry_at": now(),
                 "updated_at": now(),
             }
         },
     )
-    await update.effective_message.reply_text("PDF saved as a new run. Set/confirm the Sheet, then /start.")
+    await update.effective_message.reply_text("PDF saved as a new run. Old TOC profile cleared; send the new book TOC, then start.")
 
 
 async def set_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1234,17 +1251,57 @@ async def help_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
+# Accept normal Telegram text such as "Plant Breeding: pages 1 to 61".
+# A TOC page copied from Drive also works when each chapter is on its own line.
+TOC_LINE_RE = re.compile(
+    r"^\s*(?:\d+\s*[.)-]\s*)?([A-Za-z][A-Za-z& ,/()'’.-]{2,}?)\s*(?:[:.…\-–]+|\s{2,})\s*"
+    r"(?:page(?:s)?\s*)?(\d+|end)\s*(?:to|\-|–)?\s*(\d+|end)?\s*$", re.I | re.M
+)
+
+
+def parse_toc_profile(text: str) -> dict[str, Any] | None:
+    entries: list[tuple[str, int, int | None]] = []
+    for match in TOC_LINE_RE.finditer(text):
+        topic = re.sub(r"\s+", " ", match.group(1)).strip(" .:-")
+        first, last = match.group(2).lower(), (match.group(3) or "").lower()
+        if topic.casefold() in DEFAULT_SKIP_SECTIONS or first == "end":
+            continue
+        start = int(first)
+        end = None if last in {"", "end"} else int(last)
+        entries.append((topic, start, end))
+    # Same start may be present in an OCR duplicate; retain the first occurrence.
+    ordered: list[tuple[str, int, int | None]] = []
+    seen: set[int] = set()
+    for entry in sorted(entries, key=lambda x: x[1]):
+        if entry[1] not in seen:
+            ordered.append(entry); seen.add(entry[1])
+    if not ordered:
+        return None
+    ranges = []
+    for index, (topic, start, explicit_end) in enumerate(ordered):
+        next_start = ordered[index + 1][1] if index + 1 < len(ordered) else None
+        end = explicit_end if explicit_end is not None else (next_start - 1 if next_start else None)
+        if end is not None and end < start:
+            continue
+        ranges.append({"topic": topic, "from": start, "to": end})
+    return {"title": "", "topic_ranges": ranges, "skip_sections": DEFAULT_SKIP_SECTIONS,
+            "configured_at": now(), "source": "telegram_toc"} if ranges else None
+
+
 
 def agent_status_text(c: dict[str, Any]) -> str:
     retry = utc_datetime(c.get("next_retry_at"))
     retry_text = retry.isoformat() if retry and retry > now() else "abhi retry allowed hai"
+    profile = c.get("book_profile") or {}
+    ranges = profile.get("topic_ranges", [])
+    profile_text = f"TOC: {len(ranges)} topics configured" if ranges else "TOC: not configured"
     return (
         f"Status: {c['status']}\n"
         f"PDF page: {c['current_pdf_page']}\n"
         f"Last page: {c.get('last_page_label') or '—'}\n"
         f"MCQs: {c['total_questions']}\n"
         f"PDF: {'set' if c['pdf_url'] else 'missing'} | Sheet: {'set' if c['sheet_url'] else 'missing'}\n"
-        f"Retry: {retry_text}"
+        f"{profile_text}\nRetry: {retry_text}"
     )
 
 
@@ -1255,6 +1312,23 @@ async def agent_message(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "").strip()
     lowered = text.casefold()
     chat = update.effective_chat.id
+
+    # A user can paste a TOC in normal language; it is saved per current PDF.
+    if any(token in lowered for token in ("table of contents", "contents profile", "toc profile", "chapter page mapping", "toc set")):
+        profile = parse_toc_profile(text)
+        if not profile:
+            await update.effective_message.reply_text(
+                "TOC save nahi hua. Har line is format mein bhejiye: Plant Breeding: 1 to 61\nPlant Genetics: 62 to 93"
+            )
+            return
+        c = await asyncio.to_thread(get_config, chat)
+        await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": {"book_profile": profile, "updated_at": now()}})
+        first = profile["topic_ranges"][0]
+        await update.effective_message.reply_text(
+            f"TOC profile saved: {len(profile['topic_ranges'])} topics. MCQs start only after front matter; first configured topic is {first['topic']} (printed page {first['from']})."
+        )
+        return
+
     urls = [u.rstrip(".,)") for u in URL_RE.findall(text)]
     pdf_url = next((u for u in urls if "drive.google.com" in u), None)
     sheet_url = next((u for u in urls if "docs.google.com/spreadsheets" in u), None)
@@ -1275,6 +1349,7 @@ async def agent_message(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                                    "next_retry_at": now(), "updated_at": now()}
         if pdf_url:
             changes["pdf_url"] = pdf_url
+            changes["book_profile"] = empty_book_profile()
         if sheet_url:
             changes["sheet_url"] = sheet_url
         await asyncio.to_thread(configs.update_one, {"_id": c["_id"]}, {"$set": changes})
