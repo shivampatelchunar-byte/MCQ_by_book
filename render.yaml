@@ -1,16 +1,12 @@
 services:
   - type: web
     name: mcq-generator
-    runtime: python
+    runtime: docker
     plan: starter
     autoDeploy: true
-    buildCommand: pip install --no-cache-dir -r requirements.txt
-    # The application includes its own background worker: keep exactly one Uvicorn worker.
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.10
       - key: MONGO_URI
         sync: false
       - key: TELEGRAM_BOT_TOKEN
@@ -23,16 +19,10 @@ services:
         sync: false
       - key: GCP_SERVICE_ACCOUNT_JSON
         sync: false
-      # Preferred comma-separated credential/model configuration.
       - key: GEMINI_API_KEYS
         sync: false
       - key: GEMINI_OCR_MODELS
         value: gemini-3.6-flash
-      # Legacy names are still accepted by main.py; remove them after migration if unused.
-      - key: GEMINI_API_KEY_1
-        sync: false
-      - key: GEMINI_API_KEY_2
-        sync: false
       - key: GEMINI_MODEL
         value: gemini-3.6-flash
       - key: CEREBRAS_API_KEY
@@ -45,12 +35,34 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: MAX_PDF_MB
-        value: "80"
-      - key: OCR_DPI
+      - key: OCR_PROVIDER_ORDER
+        value: tesseract,mistral,openrouter,gemini
+      - key: LOCAL_OCR_ENABLED
+        value: "true"
+      - key: LOCAL_OCR_LANG
+        value: eng
+      - key: LOCAL_OCR_TIMEOUT_SECONDS
+        value: "90"
+      - key: LOCAL_OCR_MIN_TEXT_CHARS
         value: "120"
+      - key: MISTRAL_OCR_ENABLED
+        value: "true"
+      - key: MISTRAL_OCR_MODEL
+        value: mistral-ocr-latest
+      - key: OPENROUTER_OCR_ENABLED
+        value: "false"
+      - key: OPENROUTER_OCR_MODEL
+        sync: false
+      - key: GEMINI_OCR_ENABLED
+        value: "true"
+      - key: DAILY_QUOTA_COOLDOWN_SECONDS
+        value: "21600"
+      - key: MAX_PDF_MB
+        value: "120"
+      - key: OCR_DPI
+        value: "96"
       - key: OCR_TIMEOUT_SECONDS
-        value: "180"
+        value: "240"
       - key: WORKER_LEASE_SECONDS
         value: "300"
       - key: MAX_PAGE_ATTEMPTS
