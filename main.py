@@ -723,8 +723,12 @@ def ocr_with_fallbacks(image: bytes) -> tuple[str, list[int], str]:
             try:
                 text, numbers = gemini_vision_ocr(image)
                 return text, numbers, "gemini_vision"
-            except QuotaExhausted:
-                raise
+            except QuotaExhausted as exc:
+                # Gemini is preferred for visual understanding, but a quota state
+                # must not block authorised secondary OCR providers.
+                errors.append(f"gemini:quota:{exc.retry_seconds}s")
+                log.warning("Gemini OCR cooling down; continuing to next OCR provider")
+                continue
             except Exception as exc:
                 errors.append(f"gemini:{type(exc).__name__}")
     raise RuntimeError("All OCR providers failed: " + "; ".join(errors))
@@ -1144,6 +1148,9 @@ def process_page(config: dict[str, Any]) -> None:
             {"_id": config["_id"], "run_id": config["run_id"]},
             {"$set": {"book_profile": profile, "updated_at": now()}},
         )
+        # process_page still holds this config object for the current first page.
+        # Keep it synchronized so page 1 is immediately calibrated as TOC page 1.
+        config["book_profile"] = profile
         log.info("First TOC chapter detected at PDF page %s: %s", pdf_page, ranges[0].get("topic"))
 
     # Use only plausible footer/header labels. If OCR captured citation years,

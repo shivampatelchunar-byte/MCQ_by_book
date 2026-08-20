@@ -22,9 +22,9 @@ services:
       - key: GEMINI_API_KEYS
         sync: false
       - key: GEMINI_OCR_MODELS
-        value: gemini-3.6-flash
+        value: gemini-3.5-flash
       - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+        value: gemini-3.5-flash
       - key: CEREBRAS_API_KEY
         sync: false
       - key: GROQ_API_KEY
@@ -36,7 +36,7 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OCR_PROVIDER_ORDER
-        value: tesseract,mistral,openrouter,gemini
+        value: gemini,mistral,tesseract,openrouter
       - key: LOCAL_OCR_ENABLED
         value: "true"
       - key: LOCAL_OCR_LANG

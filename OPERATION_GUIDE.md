@@ -1,21 +1,28 @@
-# Production operation guide
+# OCR and book-page operation
 
-## Contiguous Sheet rows
+## OCR order
 
-`MCQS_PER_PAGE=5` forces five MCQs for every valid source page. A page job is created before OCR, but five Google Sheet rows are allocated only after classification and MCQ generation succeeds. Skipped Contents/Foreword/Preface pages allocate no rows, so there are no blank page blocks.
+The default production order is:
 
-## Printed Book Page validation
+1. Gemini 3.5 Flash vision OCR
+2. Mistral OCR
+3. local Tesseract
+4. optional OpenRouter vision
 
-The app extracts header/footer candidates with full-page OCR plus a narrow footer/header band pass. It rejects implausible values above `MAX_REASONABLE_BOOK_PAGE` (default 1000), which prevents citation years such as `1927`, `1933`, and `1945` from being stored as Book Page numbers.
+Gemini receives the page with a structured request for printed header/footer page numbers plus visual/table/diagram information. If Gemini returns quota/rate-limit errors, the worker **continues** to Mistral and Tesseract instead of stopping the page.
 
-At the first TOC chapter heading, the app records both the physical PDF start page and the configured printed TOC start page. Later pages accept a header/footer label only when it agrees with the calibrated TOC progression. Otherwise the Book Page is the TOC-calibrated sequence, never a raw PDF page index and never an OCR citation year.
+## Book Page correctness
 
-## Clean restart
+At the first real TOC chapter, the active profile is updated in memory and MongoDB with both the PDF start and printed TOC start. Thus the first question page is immediately resolved as printed page 1, not `Unreadable printed page`. Subsequent pages use validated footer/header labels when plausible and otherwise the TOC-calibrated sequence. Citation years are rejected.
+
+## Clean deploy
 
 1. `pause karo`
-2. Deploy this Docker release only.
-3. Ensure old services are stopped.
+2. Deploy this Docker release.
+3. Set Render variables:
+   - `GEMINI_OCR_MODELS=gemini-3.5-flash`
+   - `GEMINI_MODEL=gemini-3.5-flash`
+   - `OCR_PROVIDER_ORDER=gemini,mistral,tesseract,openrouter`
 4. `/clear_and_restart CONFIRM ALL`
-5. `status batao`
 
-The current PDF, Sheet and TOC profile stay saved. A clean restart resets chapter detection so the first real TOC chapter is located again.
+The restart keeps PDF, Sheet and TOC profile but rewinds content-start calibration and clears invalid historical output.
