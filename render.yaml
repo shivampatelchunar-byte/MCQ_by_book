@@ -67,3 +67,17 @@ services:
         value: "300"
       - key: MAX_PAGE_ATTEMPTS
         value: "3"
+      # Fixed output size eliminates blank rows between PDF pages.
+      - key: MCQS_PER_PAGE
+        value: "5"
+      # Explicit chat models avoid prompt-guard / safeguard model errors.
+      - key: GROQ_MODELS
+        value: openai/gpt-oss-20b
+      - key: MISTRAL_MODELS
+        value: mistral-medium-2508,mistral-medium-2505
+      - key: SAMBANOVA_MODELS
+        value: gpt-oss-120b,Meta-Llama-3.3-70B-Instruct
+      - key: OPENROUTER_MODELS
+        value: qwen/qwen3.8-27b
+      - key: CEREBRAS_MODELS
+        value: gpt-oss-120b
